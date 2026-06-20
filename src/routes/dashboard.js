@@ -131,6 +131,26 @@ dashboardRouter.post('/customers/create', async (req, res) => {
     res.status(201).json(customer)
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
+// ── Delete a customer (and their data), scoped to this business ──
+dashboardRouter.delete('/customers/:id', async (req, res) => {
+  const businessId = bid(req)
+  try {
+    // Only delete if the customer belongs to this business (safety)
+    const { data: customer } = await supabase.from('customers')
+      .select('id, business_id').eq('id', req.params.id).single()
+    if (!customer || customer.business_id !== businessId) {
+      return res.status(404).json({ error: 'Customer not found' })
+    }
+    // Remove related rows first to avoid orphans
+    await supabase.from('messages').delete().eq('customer_id', req.params.id)
+    await supabase.from('appointments').delete().eq('customer_id', req.params.id)
+    await supabase.from('payments').delete().eq('customer_id', req.params.id)
+    const { error } = await supabase.from('customers').delete().eq('id', req.params.id)
+    if (error) return res.status(400).json({ error: error.message })
+    res.json({ success: true })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
 dashboardRouter.post('/customers/:id/reengage', async (req, res) => {
   try {
     const { data: customer } = await supabase.from('customers')

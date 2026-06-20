@@ -19,11 +19,14 @@ export function startCronJobs() {
   // Payment follow-ups — daily 10am
   new CronJob('0 10 * * *', async () => {
     console.log('💰 Running payment follow-ups...')
-    const payments = await getOverduePayments(3)
+    const payments = await getOverduePayments(1)
     for (const p of payments) {
       const phone = p.customers?.phone, phoneId = p.businesses?.whatsapp_phone_id
       if (!phone || !phoneId) continue
       const days = Math.floor((Date.now() - new Date(p.due_date).getTime()) / 86400000)
+      // Respect each business's own reminder threshold (default 3 days)
+      const threshold = Number(p.businesses?.payment_reminder_days) || 3
+      if (days < threshold) continue
       const res = await sendMessage(phone, paymentReminder(p, days), phoneId)
       if (res.success) await markPaymentReminderSent(p.id)
     }

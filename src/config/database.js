@@ -158,9 +158,13 @@ export async function markPaymentPaid(id) {
 export async function markPaymentReminderSent(id) {
   await supabase.from('payments').update({ reminder_sent: true }).eq('id', id)
 }
-export async function getOverduePayments(daysOverdue = 3) {
+export async function getOverduePayments(daysOverdue = 1) {
+  // Pull payments overdue by at least `daysOverdue` (a low floor); the scheduler
+  // then applies each business's own payment_reminder_days threshold.
   const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - daysOverdue)
-  const { data } = await supabase.from('payments').select('*, customers(name, phone), businesses(name, upi_id, whatsapp_phone_id)').eq('status', 'pending').eq('reminder_sent', false).lte('due_date', cutoff.toISOString())
+  const { data } = await supabase.from('payments')
+    .select('*, customers(name, phone), businesses(name, upi_id, whatsapp_phone_id, payment_reminder_days)')
+    .eq('status', 'pending').eq('reminder_sent', false).lte('due_date', cutoff.toISOString())
   return data || []
 }
 
