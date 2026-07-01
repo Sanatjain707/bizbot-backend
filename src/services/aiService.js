@@ -51,7 +51,32 @@ function formatHours(business) {
   return business.working_hours || '9am-8pm Mon-Sat'
 }
 
+// "16:30" → "4:30 PM". Returns null when no last booking time is set.
+function formatLastBooking(business) {
+  const raw = business.last_booking_time
+  if (!raw || typeof raw !== 'string' || !raw.includes(':')) return null
+  const [hStr, mStr] = raw.split(':')
+  const h = parseInt(hStr, 10), m = parseInt(mStr, 10)
+  if (isNaN(h) || isNaN(m)) return null
+  const period = h >= 12 ? 'PM' : 'AM'
+  const h12 = h % 12 === 0 ? 12 : h % 12
+  return `${h12}:${String(m).padStart(2, '0')} ${period}`
+}
+
 function buildPrompt(business) {
+  const lastBooking = formatLastBooking(business)
+  // Example-backed rules hold better than bare rules. The cutoff lines only
+  // appear when a last booking time is set; the closed-day rule always applies.
+  const bookingWindow = `BOOKING WINDOW (follow strictly when offering OR accepting a slot):
+- Only offer or confirm slots inside the working hours listed above.
+- NEVER offer or confirm a slot on a day marked "Closed" — suggest the nearest open day instead.${lastBooking ? `
+- The LAST booking time is ${lastBooking}. NEVER offer or accept any slot later than ${lastBooking}, even on days that close later.
+- If a customer asks for a time after ${lastBooking}, politely decline and offer ${lastBooking} (or an earlier open slot).` : ''}
+
+Examples:${lastBooking ? `
+- Customer asks for a slot after ${lastBooking}: "Sorry ji, hamari last booking ${lastBooking} tak hoti hai 🙏 ${lastBooking} chalega? 😊"` : ''}
+- Customer asks for a day that is marked Closed: "Us din hum band rehte hain 🙏 [nearest open day] ko aa sakte hain? 😊"`
+
   return `You are BizBot, the AI WhatsApp assistant for "${business.name}" — a ${business.type || 'service business'} in India.
 
 BUSINESS DETAILS:
@@ -71,6 +96,7 @@ YOUR RULES:
 4. Never claim to be a human
 5. Never make up prices or services not listed above
 6. For unknown questions: "Main owner ko inform kar deta hoon 🙏"
+7. Only offer slots within working hours, on open days, and no later than the last booking time (see BOOKING WINDOW below)
 
 CONVERSATION FLOW (follow this order):
 - FIRST message from a new customer: greet warmly + list services with prices + ask what they'd like
@@ -83,7 +109,10 @@ CONVERSATION FLOW (follow this order):
 - If the customer ASKS ABOUT an existing appointment (e.g. "meri appointment kab ki hai?", "when is my appointment?", "what time is my booking?"), DO NOT use the ✅ format. Just tell them their appointment details in plain words like: "Aapki appointment [date] ko [time] baje [service] ke liye hai 😊" — NO ✅ symbol.
 - Never use the ✅ format to answer a question. Only use it to confirm a brand-new booking or a reschedule.
 
+${bookingWindow}
+
 APPOINTMENT BOOKING:
+- Before confirming, make sure the slot is on an open day, within working hours, and not after the last booking time (see BOOKING WINDOW)
 - When confirming a NEW booking ALWAYS use this exact format:
   "✅ Appointment confirmed: [Name], [DD-MMM-YYYY] at [HH:MM AM/PM] for [Service]"
 - Example: "✅ Appointment confirmed: Priya Sharma, 12-Jun-2026 at 3:15 PM for Facial"
