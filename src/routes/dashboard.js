@@ -3,7 +3,7 @@ import {
   getDashboardStats, getTodayAppointments, getAllAppointments,
   updateAppointmentStatus, getConversations, getMessages,
   getPendingPayments, getAllCustomers, getOrCreateCustomer,
-  createAppointment, supabase, saveMessage
+  createAppointment, supabase, saveMessage, normalizePhone
 } from '../config/database.js'
 import { sendMessage } from '../services/whatsappService.js'
 import { appointmentReminder } from '../services/aiService.js'
@@ -168,6 +168,75 @@ dashboardRouter.post('/customers/create', async (req, res) => {
     const customer = await getOrCreateCustomer(businessId, phone || `manual-${Date.now()}`, name)
     res.status(201).json(customer)
   } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+// ── Bulk import customers (source-agnostic) ──
+// Accepts [{name, phone}], reuses normalizePhone, dedupes against the DB and
+// within the file, and bulk-inserts race-safely via the unique(business_id,phone)
+// constraint. Guarantees: imported + skippedDuplicate + skippedInvalid === received.
+export async function importCustomersBulk(businessId, rows) {
+  // Ignore fully-empty rows entirely (not counted in `received`)
+  const meaningful = rows.filter(r => String(r?.name || '').trim() || String(r?.phone || '').trim())
+
+  // Existing phones for this business (paginated past the 1000-row cap)
+  const existing = new Set()
+  for (let start = 0; ; start += 1000) {
+    const { data, error } = await supabase.from('customers').select('phone').eq('business_id', businessId).range(start, start + 999)
+    if (error) throw new Error(error.message)
+    if (!data?.length) break
+    for (const c of data) existing.add(c.phone)
+    if (data.length < 1000) break
+  }
+
+  const seen = new Set()
+  const toInsert = []
+  const invalidRows = []
+  let skippedDuplicate = 0, skippedInvalid = 0
+  const now = new Date().toISOString()
+
+  for (const r of meaningful) {
+    const name     = String(r?.name  || '').trim()
+    const rawPhone = String(r?.phone || '').trim()
+    const phone    = normalizePhone(rawPhone)                 // reuse existing helper
+    const digits   = String(phone || '').replace(/\D/g, '')
+    if (digits.length < 10) {
+      skippedInvalid++
+      if (invalidRows.length < 100) invalidRows.push({ name, phone: rawPhone, reason: rawPhone ? 'invalid phone' : 'missing phone' })
+      continue
+    }
+    if (existing.has(phone) || seen.has(phone)) { skippedDuplicate++; continue }
+    seen.add(phone)
+    toInsert.push({ business_id: businessId, phone, name: name || phone, last_seen: now })
+  }
+
+  // Race-safe bulk insert; unique(business_id,phone) conflicts are silently ignored
+  let imported = 0
+  for (let i = 0; i < toInsert.length; i += 500) {
+    const batch = toInsert.slice(i, i + 500)
+    const { data, error } = await supabase.from('customers')
+      .upsert(batch, { onConflict: 'business_id,phone', ignoreDuplicates: true })
+      .select('id')
+    if (error) throw new Error(error.message)
+    imported += data?.length || 0
+  }
+  // Survivors not inserted were lost to a race → still duplicates
+  skippedDuplicate += (toInsert.length - imported)
+
+  return { received: meaningful.length, imported, skippedDuplicate, skippedInvalid, invalidRows }
+}
+
+dashboardRouter.post('/customers/import', async (req, res) => {
+  const businessId = bid(req)
+  if (!businessId) return res.status(400).json({ error: 'x-business-id required' })
+  const rows = Array.isArray(req.body?.customers) ? req.body.customers : null
+  if (!rows) return res.status(400).json({ error: 'customers array required' })
+  if (rows.length > 5000) return res.status(400).json({ error: 'Too many rows (max 5000 per import). Please split the file.' })
+  try {
+    res.json(await importCustomersBulk(businessId, rows))
+  } catch (err) {
+    console.error('❌ Customer import error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
 })
 // ── Delete a customer (and their data), scoped to this business ──
 dashboardRouter.delete('/customers/:id', async (req, res) => {
