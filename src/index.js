@@ -8,6 +8,7 @@ import { authRouter } from './routes/auth.js'
 import { billingRouter } from './routes/billing.js'
 import { demoRouter } from './routes/demo.js'
 import { broadcastRouter } from './routes/broadcast.js'
+import { analyticsRouter } from './routes/analytics.js'
 import { requireActivePlan } from './middleware/requireActivePlan.js'
 import { startCronJobs } from './jobs/scheduler.js'
 import { requestLogger } from './middleware/logger.js'
@@ -36,6 +37,7 @@ app.use('/api/business', rateLimiter, businessRouter)
 app.use('/api/billing', billingRouter)
 app.use('/api/demo', demoRouter)
 app.use('/api/broadcast', rateLimiter, requireActivePlan, broadcastRouter)
+app.use('/api/analytics', rateLimiter, analyticsRouter)   // GET-only reads — stays open when plan expired
 
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'BizBot', time: new Date().toISOString() }))
 app.use((req, res) => res.status(404).json({ error: 'Route not found' }))
