@@ -63,6 +63,44 @@ dashboardRouter.post('/appointments/:id/remind', async (req, res) => {
     res.json({ success: result.success })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
+// Remind everyone with a confirmed appointment TODAY (one message per customer).
+// Free-form sends only reach customers inside WhatsApp's 24h service window; the
+// rest are rejected with Meta code 131047. We count those separately so the UI
+// can honestly report who wasn't reached instead of a blanket "Sent!".
+dashboardRouter.post('/appointments/remind-all', async (req, res) => {
+  const businessId = bid(req)
+  if (!businessId) return res.status(400).json({ error: 'x-business-id required' })
+  try {
+    const today = new Date().toISOString().split('T')[0]   // same UTC boundary as getTodayAppointments
+    const { data: appts } = await supabase.from('appointments')
+      .select('*, customers(name, phone)')
+      .eq('business_id', businessId).eq('status', 'confirmed')
+      .gte('appointment_time', `${today}T00:00:00`).lte('appointment_time', `${today}T23:59:59`)
+      .order('appointment_time')
+    const { data: business } = await supabase.from('businesses')
+      .select('name, whatsapp_phone_id').eq('id', businessId).single()
+
+    // One reminder per customer — list is time-sorted, so the earliest slot wins
+    const seen = new Set()
+    const recipients = []
+    for (const a of appts || []) {
+      const key = a.customer_id || a.customers?.phone
+      if (!key || seen.has(key)) continue
+      seen.add(key); recipients.push(a)
+    }
+
+    let sent = 0, windowFailed = 0, otherFailed = 0
+    for (const appt of recipients) {
+      const phone = appt.customers?.phone
+      if (!phone || !business?.whatsapp_phone_id) { otherFailed++; continue }
+      const r = await sendMessage(phone, appointmentReminder({ ...appt, businesses: business }), business.whatsapp_phone_id)
+      if (r.success) sent++
+      else if (r.errorCode === 131047) windowFailed++    // outside the 24h service window
+      else otherFailed++
+    }
+    res.json({ total: recipients.length, sent, windowFailed, otherFailed })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
 
 // ── Conversations ─────────────────────────────────────
 dashboardRouter.get('/conversations', async (req, res) => {

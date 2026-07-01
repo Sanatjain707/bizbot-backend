@@ -15,7 +15,9 @@ export async function sendMessage(toPhone, text, phoneId) {
     return { success: true }
   } catch (err) {
     console.error(`❌ WA failed → ${toPhone}:`, err.response?.data?.error?.message || err.message)
-    return { success: false, error: err.message }
+    // Meta error code lets callers tell a 24h-window rejection (131047) apart
+    // from other failures (invalid number, not on WhatsApp, etc.)
+    return { success: false, error: err.message, errorCode: err.response?.data?.error?.code }
   }
 }
 
