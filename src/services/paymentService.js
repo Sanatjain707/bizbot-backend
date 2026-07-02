@@ -14,6 +14,10 @@ async function resolveAmount(business, serviceName) {
   const match = findService(business, serviceName)
   if (match?.price) return Number(match.price) || 0
 
+  // If the business has a structured services_list, DON'T fall back to LLM
+  // parsing of free-text pricing — a service not in the list is a user error
+  // or a bad LLM extraction, not something to guess a price for.
+  if (Array.isArray(business?.services_list) && business.services_list.length > 0) return 0
   if (!business?.pricing) return 0
   const pricePrompt = `Price list: "${business.pricing}"
 Service booked: "${serviceName}"

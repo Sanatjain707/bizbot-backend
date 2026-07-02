@@ -106,11 +106,13 @@ export async function hasDuplicateBooking(customerId, dateTimeUtcISO) {
   return (data?.length || 0) > 0
 }
 
-// ── Conflict: any other confirmed appointment at the same business/time ──
-// For single-chair businesses this catches double-books; multi-chair businesses
-// can set `business.allow_overlap = true` to skip the check.
+// ── Conflict: another confirmed appointment at the same exact minute (±60s) ──
+// For single-chair businesses this catches double-books. Skipped when
+// business.allow_overlap = true (multi-chair) or business.hourly_capacity is
+// set — capacity is the correct concurrency model for multi-slot businesses.
 export async function hasConflictingBooking(businessId, dateTimeUtcISO, business = null) {
   if (business?.allow_overlap) return false
+  if (business?.hourly_capacity) return false   // capacity check owns concurrency instead
   const target = new Date(dateTimeUtcISO).getTime()
   const windowStart = new Date(target - 60_000).toISOString()
   const windowEnd   = new Date(target + 60_000).toISOString()
@@ -122,6 +124,33 @@ export async function hasConflictingBooking(businessId, dateTimeUtcISO, business
     .lte('appointment_time', windowEnd)
     .limit(1)
   return (data?.length || 0) > 0
+}
+
+// ── Capacity: how many confirmed appointments already sit in this slot's
+// hourly bucket. If it's >= business.hourly_capacity, the slot is full. ──
+// The bucket is IST-anchored so a business that says "2 per hour" gets a
+// deterministic window regardless of server timezone.
+export async function countInHourBucket(businessId, dateTimeUtcISO) {
+  const target = new Date(dateTimeUtcISO)
+  // Snap to the top of the IST hour containing this timestamp.
+  const istMs = target.getTime() + (5 * 60 + 30) * 60 * 1000
+  const bucketStartIstMs = istMs - (istMs % (60 * 60 * 1000))
+  const bucketStartUtc = new Date(bucketStartIstMs - (5 * 60 + 30) * 60 * 1000).toISOString()
+  const bucketEndUtc   = new Date(bucketStartIstMs - (5 * 60 + 30) * 60 * 1000 + 60 * 60 * 1000).toISOString()
+  const { data } = await supabase.from('appointments')
+    .select('id')
+    .eq('business_id', businessId)
+    .eq('status', 'confirmed')
+    .gte('appointment_time', bucketStartUtc)
+    .lt('appointment_time', bucketEndUtc)
+  return data?.length || 0
+}
+
+export async function isHourFull(business, dateTimeUtcISO) {
+  const capacity = Number(business?.hourly_capacity) || 0
+  if (capacity <= 0) return false     // null / 0 → unlimited
+  const count = await countInHourBucket(business.id, dateTimeUtcISO)
+  return count >= capacity
 }
 
 // ── Aggregate: run every check, return the first failure with a code the
@@ -152,6 +181,13 @@ export async function validateBooking({ business, customer, dateISO, hhmm, servi
   }
   if (business?.id && await hasConflictingBooking(business.id, utcISO, business)) {
     return { valid: false, code: 'conflict', error: 'Another appointment already at this time' }
+  }
+  if (business?.id && await isHourFull(business, utcISO)) {
+    return {
+      valid: false,
+      code:  'capacity_full',
+      error: `This hour is fully booked (${business.hourly_capacity} per hour)`,
+    }
   }
 
   return {

@@ -51,7 +51,7 @@ billingRouter.post('/webhook', async (req, res) => {
   res.sendStatus(200) // respond immediately
 
   const signature = req.headers['x-razorpay-signature']
-  if (!verifyWebhookSignature(req.body, signature)) {
+  if (!verifyWebhookSignature(req.rawBody, signature)) {
     console.warn('❌ Invalid Razorpay webhook signature')
     return
   }

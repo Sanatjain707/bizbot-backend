@@ -9,7 +9,16 @@ import {
 import { validateBooking } from '../ai/validator.js'
 import { sendMessage } from '../services/whatsappService.js'
 import { appointmentReminder } from '../services/aiService.js'
+import { detectLanguage } from '../ai/messageTemplates.js'
 import { istDateStr, istMidnightUtc, istEndOfDayUtc } from '../utils/dateTime.js'
+
+// One query per customer — reminders are low-frequency, so this is fine.
+async function pickLang(customerId) {
+  const { data } = await supabase.from('messages')
+    .select('content').eq('customer_id', customerId).eq('role', 'user')
+    .order('created_at', { ascending: false }).limit(1)
+  return detectLanguage(data?.[0]?.content || '')
+}
 
 export const dashboardRouter = Router()
 const bid = req => req.headers['x-business-id']
@@ -48,16 +57,20 @@ dashboardRouter.get('/appointments', async (req, res) => {
   res.json(page)
 })
 dashboardRouter.patch('/appointments/:id', async (req, res) => {
+  const businessId = bid(req)
   const { status } = req.body
-  // If marking done, increment customer visit count
-  if (status === 'done') {
-    const { data: appt } = await supabase.from('appointments').select('customer_id').eq('id', req.params.id).single()
-    if (appt?.customer_id) {
-      const { data: cust } = await supabase.from('customers').select('total_visits').eq('id', appt.customer_id).single()
-      await supabase.from('customers').update({ total_visits: (cust?.total_visits || 0) + 1 }).eq('id', appt.customer_id)
-    }
+  // Verify the appointment belongs to this business BEFORE any side-effects.
+  const { data: appt } = await supabase.from('appointments')
+    .select('customer_id, business_id').eq('id', req.params.id).single()
+  if (!appt || appt.business_id !== businessId) {
+    return res.status(404).json({ error: 'Appointment not found' })
   }
-  const { error } = await updateAppointmentStatus(req.params.id, status)
+  // If marking done, atomically bump visit count via SQL rather than read+write.
+  if (status === 'done' && appt.customer_id) {
+    await supabase.rpc('increment_customer_visits', { p_customer_id: appt.customer_id })
+      .catch(err => console.error('visit count bump failed:', err.message))
+  }
+  const { error } = await updateAppointmentStatus(req.params.id, status, businessId)
   if (error) return res.status(400).json({ error: error.message })
   res.json({ success: true })
 })
@@ -95,7 +108,8 @@ dashboardRouter.post('/appointments/:id/remind', async (req, res) => {
       .select('*, customers(name, phone), businesses(name, whatsapp_phone_id)')
       .eq('id', req.params.id).single()
     if (!appt) return res.status(404).json({ error: 'Not found' })
-    const msg = appointmentReminder(appt)
+    const lang = await pickLang(appt.customer_id)
+    const msg = appointmentReminder(appt, lang)
     const result = await sendMessage(appt.customers.phone, msg, appt.businesses.whatsapp_phone_id)
     // Persist to the thread so the reminder shows in the conversation
     if (result.success) await saveMessage(appt.business_id, appt.customer_id, 'assistant', msg)
@@ -133,7 +147,8 @@ dashboardRouter.post('/appointments/remind-all', async (req, res) => {
     for (const appt of recipients) {
       const phone = appt.customers?.phone
       if (!phone || !business?.whatsapp_phone_id) { otherFailed++; continue }
-      const msg = appointmentReminder({ ...appt, businesses: business })
+      const lang = await pickLang(appt.customer_id)
+      const msg = appointmentReminder({ ...appt, businesses: business }, lang)
       const r = await sendMessage(phone, msg, business.whatsapp_phone_id)
       if (r.success) { sent++; await saveMessage(businessId, appt.customer_id, 'assistant', msg) }
       else if (r.errorCode === 131047) windowFailed++    // outside the 24h service window
@@ -322,8 +337,12 @@ dashboardRouter.post('/customers/:id/reengage', async (req, res) => {
     const { data: customer } = await supabase.from('customers')
       .select('*, businesses(name, whatsapp_phone_id)').eq('id', req.params.id).single()
     if (!customer) return res.status(404).json({ error: 'Not found' })
-    const name = customer.name ? `${customer.name} ji` : 'ji'
-    const msg  = `Namaste ${name}! 🙏\nHum aapko *${customer.businesses?.name}* mein miss kar rahe hain!\nAppointment book karni ho toh reply karein 😊`
+    const lang = await pickLang(customer.id)
+    const nameSuffix = lang === 'hi' ? ' ji' : ''
+    const namePart = customer.name ? `${customer.name}${nameSuffix}` : (lang === 'hi' ? 'ji' : 'there')
+    const msg = lang === 'en'
+      ? `Hi ${namePart}! 🙏\nWe miss you at *${customer.businesses?.name}*!\nReply if you'd like to book an appointment 😊`
+      : `Namaste ${namePart}! 🙏\nHum aapko *${customer.businesses?.name}* mein miss kar rahe hain!\nAppointment book karni ho toh reply karein 😊`
     const result = await sendMessage(customer.phone, msg, customer.businesses?.whatsapp_phone_id)
     if (result.success) {
       await supabase.from('customers').update({ reengagement_sent: true }).eq('id', req.params.id)

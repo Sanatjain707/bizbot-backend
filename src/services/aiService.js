@@ -9,6 +9,7 @@ import { callGroq, GROQ_API_KEY, GROQ_MODEL, hasValidGroqKey } from '../ai/groqC
 import { tryExtractAppointment } from '../ai/conversationManager.js'
 import { resolveDateTime } from '../utils/dateResolver.js'
 import { formatTime12 } from '../utils/dateTime.js'
+import { bookingRejectedMessage, detectLanguage } from '../ai/messageTemplates.js'
 export { appointmentReminder, paymentReminder, reengagementMessage } from '../ai/messageTemplates.js'
 
 const RECENT_WINDOW = 6
@@ -38,15 +39,20 @@ function resolveNote(userMessage) {
 }
 
 // ── Main message processor ────────────────────────────
-export async function processMessage(business, customer, userMessage) {
-  await saveMessage(business.id, customer.id, 'user', userMessage)
+// The webhook route now persists the inbound BEFORE returning 200 (so a
+// crashed process doesn't lose the message when Meta retries). Callers
+// that already saved pass { skipInboundSave: true } to avoid a duplicate.
+export async function processMessage(business, customer, userMessage, opts = {}) {
+  if (!opts.skipInboundSave) {
+    await saveMessage(business.id, customer.id, 'user', userMessage)
+  }
 
   console.log('🔑 GROQ_API_KEY status:', GROQ_API_KEY ? 'Found' : 'NOT FOUND — check .env file')
 
   if (!hasValidGroqKey()) {
     const fallback = 'Namaste! 🙏 AI setup ho raha hai. Thodi der mein reply karenge!'
     await saveMessage(business.id, customer.id, 'assistant', fallback)
-    return fallback
+    return { reply: fallback, correction: null }
   }
 
   try {
@@ -61,15 +67,28 @@ export async function processMessage(business, customer, userMessage) {
     if (!reply) throw new Error('Empty response from Groq')
 
     await saveMessage(business.id, customer.id, 'assistant', reply)
-    await tryExtractAppointment(business, customer, userMessage, reply)
+    const outcome = await tryExtractAppointment(business, customer, userMessage, reply)
+
+    // If the LLM said "✅ Booked" but the validator refused (capacity, holiday,
+    // conflict, etc.), send a correction so the customer isn't misled.
+    let correction = null
+    if (outcome?.status === 'rejected') {
+      // Match the customer's language so the correction doesn't feel jarring
+      // after an English AI reply.
+      const lang = detectLanguage(userMessage)
+      correction = bookingRejectedMessage(outcome.code, outcome.slot, business, lang)
+      await saveMessage(business.id, customer.id, 'assistant', correction)
+    }
 
     console.log('✅ Groq replied')
-    return reply
+    return { reply, correction }
 
   } catch (err) {
     console.error('❌ Groq call failed:', err.message)
-    const fallback = 'Namaste! 🙏 Abhi ek technical issue hai. Thodi der mein reply karenge. Sorry!'
+    const fallback = detectLanguage(userMessage) === 'en'
+      ? 'Hi! 🙏 We are facing a technical issue — will reply shortly. Sorry!'
+      : 'Namaste! 🙏 Abhi ek technical issue hai. Thodi der mein reply karenge. Sorry!'
     await saveMessage(business.id, customer.id, 'assistant', fallback)
-    return fallback
+    return { reply: fallback, correction: null }
   }
 }

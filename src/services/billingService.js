@@ -79,12 +79,17 @@ export async function createSubscription(business, planKey) {
 }
 
 // ── Verify webhook signature ──────────────────────────
-export function verifyWebhookSignature(body, signature) {
-  const expected = crypto
-    .createHmac('sha256', process.env.RAZORPAY_WEBHOOK_SECRET || process.env.RAZORPAY_KEY_SECRET)
-    .update(JSON.stringify(body))
-    .digest('hex')
-  return expected === signature
+// Razorpay signs the RAW JSON body. Re-JSON.stringify'ing a parsed body
+// loses whitespace/key-order and breaks the HMAC — so we require the raw
+// buffer captured by express.json({ verify: ... }).
+export function verifyWebhookSignature(rawBody, signature) {
+  if (!rawBody || !signature) return false
+  const secret = process.env.RAZORPAY_WEBHOOK_SECRET || process.env.RAZORPAY_KEY_SECRET
+  const raw = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(String(rawBody))
+  const expected = crypto.createHmac('sha256', secret).update(raw).digest('hex')
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(String(signature)))
+  } catch (_) { return false }
 }
 
 // ── Handle successful payment — activate plan ─────────

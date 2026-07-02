@@ -19,6 +19,7 @@ create table if not exists businesses (
   plan              text default 'none',
   plan_expires_at   timestamptz,
   razorpay_sub_id   text,
+  hourly_capacity   int,                       -- null = unlimited concurrent bookings/hour
   created_at        timestamptz default now()
 );
 

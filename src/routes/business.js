@@ -34,7 +34,7 @@ businessRouter.post('/create', async (req, res) => {
       found = data?.[0] || null
     }
     if (!found && cleanEmail) {
-      const { data } = await supabase.from('businesses').select('*').ilike('email', cleanEmail).limit(1)
+      const { data } = await supabase.from('businesses').select('*').ilike('email', cleanEmail.replace(/[%_*]/g, '')).limit(1)
       found = data?.[0] || null
       // Backfill auth_user_id if it was missing on the existing row
       if (found && auth_user_id && !found.auth_user_id) {
@@ -77,7 +77,7 @@ businessRouter.get('/by-user', async (req, res) => {
     console.log(`   by auth_user_id → ${business ? 'FOUND ' + business.id : 'not found'}`)
   }
   if (!business && email) {
-    const { data, error } = await supabase.from('businesses').select('*').ilike('email', String(email).trim().toLowerCase()).limit(1)
+    const { data, error } = await supabase.from('businesses').select('*').ilike('email', String(email).trim().toLowerCase().replace(/[%_*]/g, '')).limit(1)
     if (error) console.error('   email query error:', error.message)
     business = data?.[0] || null
     console.log(`   by email → ${business ? 'FOUND ' + business.id : 'not found'}`)
