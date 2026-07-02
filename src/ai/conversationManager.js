@@ -3,7 +3,7 @@
 // paymentService. Date resolution runs on the backend (dateResolver), not
 // the LLM — the classifier is only used as a hint when the resolver misses.
 
-import { updateCustomerName } from '../config/database.js'
+import { updateCustomerName, createBookingAlert } from '../config/database.js'
 import { classifyAppointmentIntent } from './intentClassifier.js'
 import { isNonBookingIntent, shouldCancelAppointment, shouldExtractAppointment } from './validator.js'
 import {
@@ -14,6 +14,22 @@ import {
 } from '../services/bookingService.js'
 import { tryCreatePayment } from '../services/paymentService.js'
 import { resolveDateTime } from '../utils/dateResolver.js'
+
+// Record any failed-to-book case as an alert the business owner can act on
+// in the dashboard. Fire-and-forget — a DB hiccup here shouldn't take the
+// whole webhook down.
+function logAlert(business, customer, userMsg, aiReply, reason, slot) {
+  createBookingAlert({
+    business_id:       business.id,
+    customer_id:       customer.id,
+    reason,
+    message_snippet:   userMsg,
+    ai_reply_snippet:  aiReply,
+    suggested_service: slot?.service || null,
+    suggested_date:    slot?.date || null,
+    suggested_time:    slot?.time || null,
+  }).catch(err => console.warn('createBookingAlert failed (non-fatal):', err.message))
+}
 
 // ── Reconcile the backend resolver with the classifier ──
 // Backend resolver is authoritative for dates; classifier fills in the gaps
@@ -59,6 +75,9 @@ export async function tryExtractAppointment(business, customer, userMsg, aiReply
     const slot = mergeSlot(userMsg, classified)
     if (!slot.date || !slot.time) {
       console.warn('⚠️ Booking skipped — missing date/time after resolver+classifier merge:', slot.date, slot.time)
+      // The LLM said ✅ but neither the resolver nor the classifier could pin
+      // down a concrete date/time. Owner needs to see this and act manually.
+      logAlert(business, customer, userMsg, aiReply, 'ambiguous', slot)
       return { status: 'ignored' }
     }
 
@@ -72,6 +91,7 @@ export async function tryExtractAppointment(business, customer, userMsg, aiReply
         })
         if (r.rescheduled) { console.log('🔄 Appointment rescheduled'); return { status: 'rescheduled' } }
         console.warn(`⚠️ Reschedule rejected (${r.code}): ${r.reason}`)
+        logAlert(business, customer, userMsg, aiReply, r.code, slot)
         return { status: 'rejected', code: r.code, reason: r.reason, slot }
       }
     }
@@ -83,6 +103,7 @@ export async function tryExtractAppointment(business, customer, userMsg, aiReply
       })
       if (r.rescheduled) { console.log('🔄 Updated existing appointment'); return { status: 'rescheduled' } }
       console.warn(`⚠️ Update rejected (${r.code}): ${r.reason}`)
+      logAlert(business, customer, userMsg, aiReply, r.code, slot)
       return { status: 'rejected', code: r.code, reason: r.reason, slot }
     }
 
@@ -91,6 +112,7 @@ export async function tryExtractAppointment(business, customer, userMsg, aiReply
     })
     if (!created.created) {
       console.warn(`⚠️ Booking rejected (${created.code}): ${created.reason}`)
+      logAlert(business, customer, userMsg, aiReply, created.code, slot)
       return { status: 'rejected', code: created.code, reason: created.reason, slot }
     }
     console.log('📅 ✅ Appointment saved')
@@ -100,6 +122,9 @@ export async function tryExtractAppointment(business, customer, userMsg, aiReply
 
   } catch (err) {
     console.error('⚠️ Appointment handling failed:', err.message)
+    // The pipeline itself blew up (classifier crashed, DB error, etc.).
+    // Owner needs to know so they can look at the raw thread.
+    logAlert(business, customer, userMsg, aiReply, 'extractor_failed', null)
     return { status: 'ignored' }
   }
 }

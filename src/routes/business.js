@@ -1,28 +1,41 @@
 import { Router } from 'express'
 import { getBusinessById, updateBusiness, createBusiness, supabase } from '../config/database.js'
+import { requireUserAuth, requireBusinessAuth } from '../middleware/requireBusinessAuth.js'
 
 export const businessRouter = Router()
 const bid = req => req.headers['x-business-id']
 
-businessRouter.get('/', async (req, res) => {
-  if (!bid(req)) return res.status(400).json({ error: 'x-business-id required' })
+// Tenant-scoped reads/writes MUST verify the caller owns the business.
+// Was previously open to anyone with a valid business UUID.
+businessRouter.get('/', requireBusinessAuth, async (req, res) => {
   const biz = await getBusinessById(bid(req))
   if (!biz) return res.status(404).json({ error: 'Business not found' })
   res.json(biz)
 })
 
-businessRouter.patch('/', async (req, res) => {
-  if (!bid(req)) return res.status(400).json({ error: 'x-business-id required' })
+businessRouter.patch('/', requireBusinessAuth, async (req, res) => {
   const { id, razorpay_sub_id, plan_expires_at, ...safe } = req.body
   const { data, error } = await updateBusiness(bid(req), safe)
   if (error) return res.status(400).json({ error: error.message })
   res.json(data)
 })
 
-// New business onboarding — starts a 30-day free trial
-businessRouter.post('/create', async (req, res) => {
+// Create — the user must be logged in, but they don't have a business yet,
+// so we can't require business ownership. requireUserAuth verifies the JWT
+// and also ensures the auth_user_id / email in the body matches the JWT
+// (prevents an attacker from creating a business under someone else's identity).
+businessRouter.post('/create', requireUserAuth, async (req, res) => {
   const { name, type, owner_name, services, pricing, working_hours, location, upi_id, whatsapp_phone_id, auth_user_id, email } = req.body
   if (!name) return res.status(400).json({ error: 'Business name required' })
+
+  // Identity must match the JWT — an authenticated attacker can't create a
+  // business under someone else's auth_user_id or email.
+  if (auth_user_id && auth_user_id !== req.auth.userId) {
+    return res.status(403).json({ error: 'auth_user_id does not match token' })
+  }
+  if (email && req.auth.email && String(email).trim().toLowerCase() !== req.auth.email.toLowerCase()) {
+    return res.status(403).json({ error: 'email does not match token' })
+  }
 
   // ── Guard against duplicates: if this user already has a business, return it ──
   // Match by auth_user_id first, then by email (catches same person via email↔Google).
@@ -60,12 +73,21 @@ businessRouter.post('/create', async (req, res) => {
   res.status(201).json(data)
 })
 
-// Find a business for a logged-in auth user (by auth_user_id or email)
-// Used after login/Google to decide: go to dashboard (exists) or onboarding (new)
-businessRouter.get('/by-user', async (req, res) => {
+// Find a business for a logged-in auth user (by auth_user_id or email).
+// Used after login/Google to decide: go to dashboard (exists) or onboarding (new).
+// JWT-gated + self-only — the caller can only look up THEIR OWN identity.
+// Closes an email-enumeration attack where any unauthed request could probe
+// which emails have BizBot accounts.
+businessRouter.get('/by-user', requireUserAuth, async (req, res) => {
   const authId = req.query.auth_user_id
   const email  = req.query.email
   if (!authId && !email) return res.status(400).json({ error: 'auth_user_id or email required' })
+  if (authId && authId !== req.auth.userId) {
+    return res.status(403).json({ error: 'auth_user_id does not match token' })
+  }
+  if (email && req.auth.email && String(email).trim().toLowerCase() !== req.auth.email.toLowerCase()) {
+    return res.status(403).json({ error: 'email does not match token' })
+  }
 
   console.log(`🔎 by-user lookup → auth_user_id="${authId}" email="${email}"`)
 
@@ -85,9 +107,9 @@ businessRouter.get('/by-user', async (req, res) => {
   res.json({ business })
 })
 
-// Plan status — used by frontend for countdown + lock state
-businessRouter.get('/plan-status', async (req, res) => {
-  if (!bid(req)) return res.status(400).json({ error: 'x-business-id required' })
+// Plan status — used by frontend for countdown + lock state. Gated so
+// an attacker can't probe expiry dates of arbitrary businesses.
+businessRouter.get('/plan-status', requireBusinessAuth, async (req, res) => {
   const biz = await getBusinessById(bid(req))
   if (!biz) return res.status(404).json({ error: 'Not found' })
 

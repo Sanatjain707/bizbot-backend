@@ -354,6 +354,71 @@ export async function getDashboardStats(businessId) {
   return { todayAppointments: appts.data?.length || 0, pendingPayments: pendingAmount, aiRepliesToday: messages.data?.length || 0, newCustomersToday: newCust.data?.length || 0 }
 }
 
+// ── Booking-failure alerts ────────────────────────────
+// Recorded every time the extractor/validator can't complete a booking so
+// the business owner can act manually. `reason` maps to validator codes
+// (capacity_full, closed_day, holiday, past_datetime, outside_hours,
+// after_cutoff, unknown_service, duplicate, conflict, missing_datetime) or
+// pipeline codes (llm_error, extractor_failed, ambiguous).
+export async function createBookingAlert(fields) {
+  // Trim snippets so we don't store multi-KB payloads for every failed booking.
+  const clip = (s) => (s == null ? null : String(s).slice(0, 500))
+  const payload = {
+    business_id:       fields.business_id,
+    customer_id:       fields.customer_id,
+    reason:            fields.reason,
+    message_snippet:   clip(fields.message_snippet),
+    ai_reply_snippet:  clip(fields.ai_reply_snippet),
+    suggested_service: fields.suggested_service || null,
+    suggested_date:    fields.suggested_date || null,
+    suggested_time:    fields.suggested_time || null,
+  }
+  const { data, error } = await supabase.from('booking_alerts').insert(payload).select().single()
+  if (error) console.error('createBookingAlert failed:', error.message)
+  return { alert: data, error }
+}
+
+export async function getBookingAlerts(businessId, { status = 'open', limit = 50, cursor = null } = {}) {
+  const capped = Math.max(1, Math.min(200, Number(limit) || 50))
+  let q = supabase.from('booking_alerts')
+    .select('*, customers(name, phone)')
+    .eq('business_id', businessId)
+    .order('created_at', { ascending: false })
+    .order('id', { ascending: false })
+    .limit(capped + 1)
+  if (status && status !== 'all') q = q.eq('status', status)
+  if (cursor) {
+    const { data: anchor } = await supabase.from('booking_alerts').select('created_at, id').eq('id', cursor).single()
+    if (anchor) q = q.or(`created_at.lt.${anchor.created_at},and(created_at.eq.${anchor.created_at},id.lt.${anchor.id})`)
+  }
+  const { data } = await q
+  const rows = data || []
+  const hasMore = rows.length > capped
+  const page = hasMore ? rows.slice(0, capped) : rows
+  return { alerts: page, nextCursor: hasMore ? page[page.length - 1].id : null }
+}
+
+export async function countOpenBookingAlerts(businessId) {
+  const { count } = await supabase.from('booking_alerts')
+    .select('id', { count: 'exact', head: true })
+    .eq('business_id', businessId).eq('status', 'open')
+  return count || 0
+}
+
+export async function updateBookingAlertStatus(id, businessId, status) {
+  const { error } = await supabase.from('booking_alerts')
+    .update({ status, handled_at: new Date().toISOString() })
+    .eq('id', id).eq('business_id', businessId)
+  return { error }
+}
+
+export async function getBookingAlert(id, businessId) {
+  const { data } = await supabase.from('booking_alerts')
+    .select('*, customers(name, phone)')
+    .eq('id', id).eq('business_id', businessId).single()
+  return data
+}
+
 function timeAgo(date) {
   const diff = Math.floor((Date.now() - new Date(date).getTime()) / 60000)
   if (diff < 1) return 'just now'

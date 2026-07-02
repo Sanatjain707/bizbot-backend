@@ -3,7 +3,7 @@
 // whether to touch appointments/payments. No booking logic lives here.
 
 import 'dotenv/config'
-import { saveMessage, getHistoryWindow } from '../config/database.js'
+import { saveMessage, getHistoryWindow, createBookingAlert } from '../config/database.js'
 import { buildPrompt } from '../ai/prompt/index.js'
 import { callGroq, GROQ_API_KEY, GROQ_MODEL, hasValidGroqKey } from '../ai/groqClient.js'
 import { tryExtractAppointment } from '../ai/conversationManager.js'
@@ -89,6 +89,15 @@ export async function processMessage(business, customer, userMessage, opts = {})
       ? 'Hi! 🙏 We are facing a technical issue — will reply shortly. Sorry!'
       : 'Namaste! 🙏 Abhi ek technical issue hai. Thodi der mein reply karenge. Sorry!'
     await saveMessage(business.id, customer.id, 'assistant', fallback)
+    // Owner needs to know the AI was down for this customer — surface it as
+    // an alert so they can review the thread and reply/book manually.
+    createBookingAlert({
+      business_id:      business.id,
+      customer_id:      customer.id,
+      reason:           'llm_error',
+      message_snippet:  userMessage,
+      ai_reply_snippet: fallback,
+    }).catch(() => {})
     return { reply: fallback, correction: null }
   }
 }

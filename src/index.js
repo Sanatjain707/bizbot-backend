@@ -11,9 +11,10 @@ import { broadcastRouter } from './routes/broadcast.js'
 import { analyticsRouter } from './routes/analytics.js'
 import { requireActivePlan } from './middleware/requireActivePlan.js'
 import { requireBusinessAuth } from './middleware/requireBusinessAuth.js'
+import { securityHeaders } from './middleware/securityHeaders.js'
 import { startCronJobs } from './jobs/scheduler.js'
 import { requestLogger } from './middleware/logger.js'
-import { rateLimiter } from './middleware/rateLimiter.js'
+import { rateLimiter, tenantRateLimiter } from './middleware/rateLimiter.js'
 
 const app = express()
 const PORT = process.env.PORT || 3000
@@ -26,6 +27,7 @@ app.use(express.json({
   verify: (req, _res, buf) => { req.rawBody = buf },
 }))
 app.use(requestLogger)
+app.use(securityHeaders)
 
 // CORS: default open for local dev, lock to FRONTEND_URL in production.
 // Multiple origins can be given as a comma-separated list.
@@ -46,14 +48,19 @@ app.use((req, res, next) => {
 })
 
 app.use('/webhook', whatsappRouter)
-app.use('/api/auth', rateLimiter, authRouter)
-app.use('/api/dashboard', rateLimiter, requireBusinessAuth, requireActivePlan, dashboardRouter)
-app.use('/api/payments',  rateLimiter, requireBusinessAuth, requireActivePlan, paymentsRouter)
-app.use('/api/business',  rateLimiter, businessRouter)          // includes public /by-user and /create paths
-app.use('/api/billing',   billingRouter)
-app.use('/api/demo',      demoRouter)
-app.use('/api/broadcast', rateLimiter, requireBusinessAuth, requireActivePlan, broadcastRouter)
-app.use('/api/analytics', rateLimiter, requireBusinessAuth, analyticsRouter)
+app.use('/api/auth',      rateLimiter, authRouter)
+app.use('/api/dashboard', rateLimiter, requireBusinessAuth, tenantRateLimiter, requireActivePlan, dashboardRouter)
+app.use('/api/payments',  rateLimiter, requireBusinessAuth, tenantRateLimiter, requireActivePlan, paymentsRouter)
+// businessRouter applies its own per-route auth (mix of requireUserAuth and
+// requireBusinessAuth). The tenant limiter still keys off x-business-id when
+// present and falls back to IP for the pre-onboarding paths.
+app.use('/api/business',  rateLimiter, tenantRateLimiter, businessRouter)
+// billingRouter applies its own per-route auth. Webhook and callback are
+// intentionally open (external POSTs from Razorpay).
+app.use('/api/billing',   rateLimiter, tenantRateLimiter, billingRouter)
+app.use('/api/demo',      rateLimiter, demoRouter)
+app.use('/api/broadcast', rateLimiter, requireBusinessAuth, tenantRateLimiter, requireActivePlan, broadcastRouter)
+app.use('/api/analytics', rateLimiter, requireBusinessAuth, tenantRateLimiter, analyticsRouter)
 
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'BizBot', time: new Date().toISOString() }))
 app.use((req, res) => res.status(404).json({ error: 'Route not found' }))

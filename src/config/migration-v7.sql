@@ -53,6 +53,40 @@ create unique index if not exists uniq_appointments_customer_time_confirmed
 create index if not exists idx_messages_customer_id_id
   on messages(customer_id, id);
 
+-- Booking-failure alerts. Every time the extractor or validator refuses to
+-- create an appointment (capacity full, closed day, ambiguous input, LLM
+-- error, etc.), we log the attempt so the business owner can act on it
+-- manually. Bot already tells the customer "try another time" — this table
+-- gives the owner visibility so they can close the loop.
+create table if not exists booking_alerts (
+  id                  uuid primary key default uuid_generate_v4(),
+  business_id         uuid references businesses(id) on delete cascade,
+  customer_id         uuid references customers(id) on delete cascade,
+  reason              text not null,
+  message_snippet     text,
+  ai_reply_snippet    text,
+  suggested_service   text,
+  suggested_date      text,           -- YYYY-MM-DD in IST when known
+  suggested_time      text,           -- HH:MM in 24h when known
+  status              text default 'open' check (status in ('open','handled','dismissed')),
+  handled_at          timestamptz,
+  created_at          timestamptz default now()
+);
+
+create index if not exists idx_booking_alerts_biz_status_created
+  on booking_alerts(business_id, status, created_at desc);
+alter table booking_alerts enable row level security;
+
+-- Plan pricing model changed from feature-tier (starter/growth/pro) to
+-- period-based (quarterly/half_yearly/annual). Existing paid rows keep working
+-- until plan_expires_at — customers just see their old key name until they
+-- next renew. No column type change (plan is `text`), no data migration
+-- required. Uncomment the block below only if you want to force everyone off
+-- the old tier names immediately:
+--   update businesses set plan = 'expired'
+--    where plan in ('starter', 'growth', 'pro')
+--      and (plan_expires_at is null or plan_expires_at < now());
+
 -- Atomic visit-count bump — prevents lost updates on concurrent
 -- "mark done" clicks. The client used to read total_visits, add 1, write
 -- back; two racing writers both saw the same starting value.
