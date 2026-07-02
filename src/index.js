@@ -37,11 +37,15 @@ app.use(requestLogger)
 app.use(securityHeaders)
 
 // CORS: default open for local dev, lock to FRONTEND_URL in production.
-// Multiple origins can be given as a comma-separated list.
+// Multiple origins can be given as a comma-separated list. Trailing slashes
+// are stripped from both sides — browsers omit them from the Origin header
+// (an Origin is just scheme+host+port, no path), so a `FRONTEND_URL=...vercel.app/`
+// used to silently fail-match. Now equivalent to the un-slashed form.
+const stripSlash = (s) => s.replace(/\/+$/, '')
 const ALLOWED_ORIGINS = (process.env.FRONTEND_URL || '*')
-  .split(',').map(s => s.trim()).filter(Boolean)
+  .split(',').map(s => stripSlash(s.trim())).filter(Boolean)
 app.use((req, res, next) => {
-  const origin = req.headers.origin
+  const origin = req.headers.origin ? stripSlash(req.headers.origin) : ''
   const allowAny = ALLOWED_ORIGINS.includes('*')
   if (allowAny) res.header('Access-Control-Allow-Origin', '*')
   else if (origin && ALLOWED_ORIGINS.includes(origin)) {
