@@ -60,6 +60,8 @@ dashboardRouter.post('/appointments/:id/remind', async (req, res) => {
     if (!appt) return res.status(404).json({ error: 'Not found' })
     const msg = appointmentReminder(appt)
     const result = await sendMessage(appt.customers.phone, msg, appt.businesses.whatsapp_phone_id)
+    // Persist to the thread so the reminder shows in the conversation
+    if (result.success) await saveMessage(appt.business_id, appt.customer_id, 'assistant', msg)
     res.json({ success: result.success })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -93,8 +95,9 @@ dashboardRouter.post('/appointments/remind-all', async (req, res) => {
     for (const appt of recipients) {
       const phone = appt.customers?.phone
       if (!phone || !business?.whatsapp_phone_id) { otherFailed++; continue }
-      const r = await sendMessage(phone, appointmentReminder({ ...appt, businesses: business }), business.whatsapp_phone_id)
-      if (r.success) sent++
+      const msg = appointmentReminder({ ...appt, businesses: business })
+      const r = await sendMessage(phone, msg, business.whatsapp_phone_id)
+      if (r.success) { sent++; await saveMessage(businessId, appt.customer_id, 'assistant', msg) }
       else if (r.errorCode === 131047) windowFailed++    // outside the 24h service window
       else otherFailed++
     }
@@ -266,7 +269,10 @@ dashboardRouter.post('/customers/:id/reengage', async (req, res) => {
     const name = customer.name ? `${customer.name} ji` : 'ji'
     const msg  = `Namaste ${name}! 🙏\nHum aapko *${customer.businesses?.name}* mein miss kar rahe hain!\nAppointment book karni ho toh reply karein 😊`
     const result = await sendMessage(customer.phone, msg, customer.businesses?.whatsapp_phone_id)
-    if (result.success) await supabase.from('customers').update({ reengagement_sent: true }).eq('id', req.params.id)
+    if (result.success) {
+      await supabase.from('customers').update({ reengagement_sent: true }).eq('id', req.params.id)
+      await saveMessage(customer.business_id, customer.id, 'assistant', msg)
+    }
     res.json({ success: result.success })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })

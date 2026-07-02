@@ -1,5 +1,5 @@
 import { CronJob } from 'cron'
-import { getUpcomingForReminder, markReminderSent, getOverduePayments, markPaymentReminderSent } from '../config/database.js'
+import { getUpcomingForReminder, markReminderSent, getOverduePayments, markPaymentReminderSent, saveMessage } from '../config/database.js'
 import { sendMessage } from '../services/whatsappService.js'
 import { appointmentReminder, paymentReminder } from '../services/aiService.js'
 
@@ -11,8 +11,9 @@ export function startCronJobs() {
     for (const appt of appts) {
       const phone = appt.customers?.phone, phoneId = appt.businesses?.whatsapp_phone_id
       if (!phone || !phoneId) continue
-      const res = await sendMessage(phone, appointmentReminder(appt), phoneId)
-      if (res.success) await markReminderSent(appt.id)
+      const msg = appointmentReminder(appt)
+      const res = await sendMessage(phone, msg, phoneId)
+      if (res.success) { await markReminderSent(appt.id); await saveMessage(appt.business_id, appt.customer_id, 'assistant', msg) }
     }
   }, null, true)
 
@@ -27,8 +28,9 @@ export function startCronJobs() {
       // Respect each business's own reminder threshold (default 3 days)
       const threshold = Number(p.businesses?.payment_reminder_days) || 3
       if (days < threshold) continue
-      const res = await sendMessage(phone, paymentReminder(p, days), phoneId)
-      if (res.success) await markPaymentReminderSent(p.id)
+      const msg = paymentReminder(p, days)
+      const res = await sendMessage(phone, msg, phoneId)
+      if (res.success) { await markPaymentReminderSent(p.id); await saveMessage(p.business_id, p.customer_id, 'assistant', msg) }
     }
   }, null, true)
 

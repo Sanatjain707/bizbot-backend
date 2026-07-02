@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import { getPaymentById, markPaymentPaid, markPaymentReminderSent } from '../config/database.js'
+import { getPaymentById, markPaymentPaid, markPaymentReminderSent, saveMessage } from '../config/database.js'
 import { sendMessage } from '../services/whatsappService.js'
 import { paymentReminder } from '../services/aiService.js'
 
@@ -20,6 +20,7 @@ paymentsRouter.post('/:id/remind', async (req, res) => {
 
     if (result.success) {
       await markPaymentReminderSent(payment.id)
+      await saveMessage(payment.business_id, payment.customer_id, 'assistant', msg)
       res.json({ success: true })
     } else {
       // Surface the real WhatsApp error (e.g. 24-hour window)
