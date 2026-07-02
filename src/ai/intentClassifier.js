@@ -1,5 +1,14 @@
 import { callGroq } from './groqClient.js'
 
+function parseClassifierJson(raw) {
+  try {
+    return JSON.parse(String(raw).replace(/```json|```/gi, '').trim())
+  } catch (err) {
+    console.warn('⚠️ Appointment classifier returned invalid JSON:', err.message)
+    return null
+  }
+}
+
 export async function classifyAppointmentIntent(userMsg, aiReply) {
   const today    = new Date()
   const tomorrow = new Date(today)
@@ -32,8 +41,11 @@ Return exactly:
 
 If intent is "query" or "other", set service/date/time/name to empty strings.`
 
-  const result = await callGroq('You are a JSON intent classifier. Return only raw JSON, no markdown.', [], extractPrompt)
+  const result = await callGroq('You are a JSON intent classifier. Return only raw JSON, no markdown.', [], extractPrompt, {
+    maxTokens: 180,
+    temperature: 0,
+  })
   if (!result) return null
 
-  return JSON.parse(result.replace(/```json|```/gi, '').trim())
+  return parseClassifierJson(result)
 }

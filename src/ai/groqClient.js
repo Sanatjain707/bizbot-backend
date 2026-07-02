@@ -13,8 +13,17 @@ export function hasValidGroqKey() {
   return Boolean(GROQ_API_KEY && !GROQ_API_KEY.includes('REPLACE') && GROQ_API_KEY.length >= 10)
 }
 
+async function readJson(response) {
+  try {
+    return await response.json()
+  } catch (_) {
+    return null
+  }
+}
+
 // ── Call Groq (OpenAI-compatible chat completions) ────
-export async function callGroq(systemPrompt, history, userMessage, attempt = 1) {
+export async function callGroq(systemPrompt, history, userMessage, options = {}, attempt = 1) {
+  const { maxTokens = 400, temperature = 0.7 } = options
   const messages = [{ role: 'system', content: systemPrompt }]
   for (const msg of history) {
     messages.push({ role: msg.role === 'assistant' ? 'assistant' : 'user', content: msg.content })
@@ -30,12 +39,12 @@ export async function callGroq(systemPrompt, history, userMessage, attempt = 1) 
     body: JSON.stringify({
       model:       GROQ_MODEL,
       messages,
-      max_tokens:  400,
-      temperature: 0.7,
+      max_tokens:  maxTokens,
+      temperature,
     })
   })
 
-  const data = await response.json()
+  const data = await readJson(response)
 
   if (!response.ok) {
     if (response.status === 429 && attempt <= 3) {
@@ -43,7 +52,7 @@ export async function callGroq(systemPrompt, history, userMessage, attempt = 1) 
       const waitMs = retryAfter ? (parseFloat(retryAfter) + 1) * 1000 : attempt * 2000
       console.warn(`⏳ Groq rate limited. Retry ${attempt}/3 in ${waitMs/1000}s...`)
       await sleep(waitMs)
-      return callGroq(systemPrompt, history, userMessage, attempt + 1)
+      return callGroq(systemPrompt, history, userMessage, options, attempt + 1)
     }
     console.error('❌ Groq error:', JSON.stringify(data?.error))
     throw new Error(data?.error?.message || `HTTP ${response.status}`)
