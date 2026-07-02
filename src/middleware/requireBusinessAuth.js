@@ -24,6 +24,10 @@ async function verifyJwt(req, res) {
 }
 
 export async function requireUserAuth(req, res, next) {
+  // Even in dev mode (AUTH_REQUIRED=false) we set req.auth = {} so downstream
+  // route handlers can safely read req.auth.userId without a TypeError.
+  // Was crashing the whole Node process on Railway (unhandled rejection).
+  req.auth = req.auth || {}
   if (!AUTH_REQUIRED) return next()
   try {
     const user = await verifyJwt(req, res)
@@ -37,11 +41,15 @@ export async function requireUserAuth(req, res, next) {
 }
 
 export async function requireBusinessAuth(req, res, next) {
+  const businessId = req.headers['x-business-id']
+  // Same defensive default as requireUserAuth so downstream handlers can
+  // safely read req.auth.businessId regardless of auth mode.
+  req.auth = req.auth || {}
+  if (businessId) req.auth.businessId = businessId
   if (!AUTH_REQUIRED) {
-    if (!req.headers['x-business-id']) return res.status(400).json({ error: 'x-business-id required' })
+    if (!businessId) return res.status(400).json({ error: 'x-business-id required' })
     return next()
   }
-  const businessId = req.headers['x-business-id']
   if (!businessId) return res.status(400).json({ error: 'x-business-id required' })
 
   try {

@@ -19,6 +19,13 @@ import { rateLimiter, tenantRateLimiter } from './middleware/rateLimiter.js'
 const app = express()
 const PORT = process.env.PORT || 3000
 
+// Railway/Vercel/most PaaS put us behind a reverse proxy. Tell Express to
+// trust ONE hop of X-Forwarded-For so req.ip returns the real client IP.
+// Required by express-rate-limit — without it, it throws a validation
+// error inside keyGenerator and every rate-limited request 500s. `1`
+// means trust the immediate proxy only, not arbitrary upstream ones.
+app.set('trust proxy', 1)
+
 // Body-size cap — a WhatsApp webhook is well under 20kb. The bulk customer
 // import route (up to 5000 rows) overrides this locally if needed. We
 // capture the raw body so the WhatsApp webhook can verify x-hub-signature-256.
@@ -72,6 +79,17 @@ const server = app.listen(PORT, () => {
   console.log(`💳 Billing:   http://localhost:${PORT}/api/billing`)
   console.log(`💚 Health:    http://localhost:${PORT}/health\n`)
   startCronJobs()
+})
+
+// Node 24 kills the process on unhandled promise rejections by default.
+// One buggy route handler used to take the whole server down → Railway 502
+// for every subsequent request. Log and continue instead — the failing
+// request already 500'd; other traffic should keep working.
+process.on('unhandledRejection', (reason) => {
+  console.error('unhandledRejection:', reason)
+})
+process.on('uncaughtException', (err) => {
+  console.error('uncaughtException:', err)
 })
 
 // Graceful shutdown so in-flight requests finish and the Supabase client

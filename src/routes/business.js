@@ -29,11 +29,12 @@ businessRouter.post('/create', requireUserAuth, async (req, res) => {
   if (!name) return res.status(400).json({ error: 'Business name required' })
 
   // Identity must match the JWT — an authenticated attacker can't create a
-  // business under someone else's auth_user_id or email.
-  if (auth_user_id && auth_user_id !== req.auth.userId) {
+  // business under someone else's auth_user_id or email. Skipped when
+  // AUTH_REQUIRED=false (req.auth is empty in that mode).
+  if (req.auth?.userId && auth_user_id && auth_user_id !== req.auth.userId) {
     return res.status(403).json({ error: 'auth_user_id does not match token' })
   }
-  if (email && req.auth.email && String(email).trim().toLowerCase() !== req.auth.email.toLowerCase()) {
+  if (req.auth?.email && email && String(email).trim().toLowerCase() !== req.auth.email.toLowerCase()) {
     return res.status(403).json({ error: 'email does not match token' })
   }
 
@@ -82,10 +83,13 @@ businessRouter.get('/by-user', requireUserAuth, async (req, res) => {
   const authId = req.query.auth_user_id
   const email  = req.query.email
   if (!authId && !email) return res.status(400).json({ error: 'auth_user_id or email required' })
-  if (authId && authId !== req.auth.userId) {
+  // Same self-only check as /create — but only enforced when we actually
+  // have a verified identity from a JWT. In AUTH_REQUIRED=false mode
+  // (req.auth empty), the query param controls the lookup by itself.
+  if (req.auth?.userId && authId && authId !== req.auth.userId) {
     return res.status(403).json({ error: 'auth_user_id does not match token' })
   }
-  if (email && req.auth.email && String(email).trim().toLowerCase() !== req.auth.email.toLowerCase()) {
+  if (req.auth?.email && email && String(email).trim().toLowerCase() !== req.auth.email.toLowerCase()) {
     return res.status(403).json({ error: 'email does not match token' })
   }
 
