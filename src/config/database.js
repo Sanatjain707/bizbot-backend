@@ -1,5 +1,6 @@
 import 'dotenv/config'
 import { createClient } from '@supabase/supabase-js'
+import { istDateStr, istMidnightUtc, istEndOfDayUtc } from '../utils/dateTime.js'
 
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
   throw new Error('❌ Missing SUPABASE_URL or SUPABASE_SERVICE_KEY in .env')
@@ -74,19 +75,112 @@ export async function getHistory(customerId, limit = 12) {
   const { data } = await supabase.from('messages').select('role, content').eq('customer_id', customerId).order('created_at', { ascending: false }).limit(limit)
   return (data || []).reverse()
 }
-export async function getConversations(businessId) {
-  const { data: customers } = await supabase.from('customers').select('id, name, phone, last_seen, ai_enabled').eq('business_id', businessId).order('last_seen', { ascending: false }).limit(50)
-  if (!customers) return []
-  const result = []
-  for (const c of customers) {
-    const { data: msgs } = await supabase.from('messages').select('role, content, created_at').eq('customer_id', c.id).order('created_at', { ascending: false }).limit(1)
-    result.push({ id: c.id, phone: c.phone, name: c.name, ai_enabled: c.ai_enabled !== false, last_msg: msgs?.[0]?.content?.slice(0, 60) || '', last_time: timeAgo(c.last_seen), unread: msgs?.[0]?.role === 'user' ? 1 : 0 })
+// ── Windowed history: recent verbatim + earlier turns to summarize ──
+// aiService uses this to keep the last N messages full-fidelity and roll
+// everything older into a cheap concat summary (fewer tokens per turn).
+export async function getHistoryWindow(customerId, recent = 6, lookback = 40) {
+  const { data } = await supabase.from('messages')
+    .select('role, content')
+    .eq('customer_id', customerId)
+    .order('created_at', { ascending: false })
+    .limit(lookback)
+  const chrono = (data || []).reverse()
+  if (chrono.length <= recent) return { recent: chrono, older: [] }
+  return {
+    recent: chrono.slice(-recent),
+    older:  chrono.slice(0, -recent),
   }
-  return result
+}
+export async function getConversations(businessId, { cursor = null, limit = 50, search = null } = {}) {
+  const capped = Math.max(1, Math.min(200, Number(limit) || 50))
+  let query = supabase.from('customers')
+    .select('id, name, phone, last_seen, ai_enabled')
+    .eq('business_id', businessId)
+    .order('last_seen', { ascending: false })
+    .order('id', { ascending: false })
+    .limit(capped + 1)
+  if (search) {
+    const s = String(search).trim()
+    if (s) query = query.or(`name.ilike.%${s}%,phone.ilike.%${s}%`)
+  }
+  if (cursor) {
+    const { data: anchor } = await supabase.from('customers').select('last_seen, id').eq('id', cursor).single()
+    if (anchor) {
+      query = query.or(`last_seen.lt.${anchor.last_seen},and(last_seen.eq.${anchor.last_seen},id.lt.${anchor.id})`)
+    }
+  }
+  const { data: customers } = await query
+  const rows = customers || []
+  const hasMore = rows.length > capped
+  const page = hasMore ? rows.slice(0, capped) : rows
+
+  // ── Batch last-message lookup (was N+1: one query per customer) ──
+  // Pull the most recent ~N*4 messages across the whole page in a single
+  // query, then pick the newest per customer in JS. The 4× multiplier is a
+  // safety margin so a chatty customer doesn't crowd out someone quieter.
+  const customerIds = page.map(c => c.id)
+  const lastByCustomer = new Map()
+  if (customerIds.length) {
+    const { data: recent } = await supabase.from('messages')
+      .select('customer_id, role, content, created_at')
+      .in('customer_id', customerIds)
+      .order('created_at', { ascending: false })
+      .limit(customerIds.length * 4)
+    for (const m of recent || []) {
+      if (!lastByCustomer.has(m.customer_id)) lastByCustomer.set(m.customer_id, m)
+    }
+    // Anyone missed by the safety window (very rare) gets one small fallback query.
+    const missing = customerIds.filter(id => !lastByCustomer.has(id))
+    for (const id of missing) {
+      const { data: msgs } = await supabase.from('messages')
+        .select('role, content, created_at')
+        .eq('customer_id', id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+      if (msgs?.[0]) lastByCustomer.set(id, msgs[0])
+    }
+  }
+
+  const result = page.map(c => {
+    const last = lastByCustomer.get(c.id)
+    return {
+      id: c.id, phone: c.phone, name: c.name,
+      ai_enabled: c.ai_enabled !== false,
+      last_msg:  last?.content?.slice(0, 60) || '',
+      last_time: timeAgo(c.last_seen),
+      unread:    last?.role === 'user' ? 1 : 0,
+    }
+  })
+  return { conversations: result, nextCursor: hasMore ? page[page.length - 1].id : null }
 }
 export async function getMessages(customerId) {
   const { data } = await supabase.from('messages').select('*').eq('customer_id', customerId).order('created_at', { ascending: true })
   return data || []
+}
+// ── Cursor-paginated messages ─────────────────────────
+// Newest-first, keyset paginated. `cursor` is the `id` of the last row from
+// the previous page; caller passes it back to get the next slice. Returns
+// { messages, nextCursor: null | 'uuid' }.
+export async function getMessagesPage(customerId, { cursor = null, limit = 50 } = {}) {
+  const capped = Math.max(1, Math.min(200, Number(limit) || 50))
+  let query = supabase.from('messages')
+    .select('id, role, content, created_at')
+    .eq('customer_id', customerId)
+    .order('created_at', { ascending: false })
+    .order('id', { ascending: false })
+    .limit(capped + 1)
+  if (cursor) {
+    // Fetch the cursor row's timestamp so we can seek past it.
+    const { data: anchor } = await supabase.from('messages').select('created_at, id').eq('id', cursor).single()
+    if (anchor) {
+      query = query.or(`created_at.lt.${anchor.created_at},and(created_at.eq.${anchor.created_at},id.lt.${anchor.id})`)
+    }
+  }
+  const { data } = await query
+  const rows = data || []
+  const hasMore = rows.length > capped
+  const page = hasMore ? rows.slice(0, capped) : rows
+  return { messages: page, nextCursor: hasMore ? page[page.length - 1].id : null }
 }
 
 // ── Appointments ──────────────────────────────────────
@@ -115,13 +209,45 @@ export async function cancelAppointment(id) {
   await supabase.from('appointments').update({ status: 'cancelled' }).eq('id', id)
 }
 export async function getTodayAppointments(businessId) {
-  const today = new Date().toISOString().split('T')[0]
-  const { data } = await supabase.from('appointments').select('*, customers(name, phone)').eq('business_id', businessId).gte('appointment_time', `${today}T00:00:00`).lte('appointment_time', `${today}T23:59:59`).order('appointment_time')
+  const today = istDateStr()
+  const { data } = await supabase.from('appointments')
+    .select('*, customers(name, phone)')
+    .eq('business_id', businessId)
+    .gte('appointment_time', istMidnightUtc(today))
+    .lte('appointment_time', istEndOfDayUtc(today))
+    .order('appointment_time')
   return data || []
 }
 export async function getAllAppointments(businessId) {
   const { data } = await supabase.from('appointments').select('*, customers(name, phone)').eq('business_id', businessId).order('appointment_time', { ascending: false })
   return data || []
+}
+// ── Cursor-paginated appointments with filters ────────
+// filters: { status, from, to, customerId, service }
+export async function getAppointmentsPage(businessId, { cursor = null, limit = 50, filters = {} } = {}) {
+  const capped = Math.max(1, Math.min(200, Number(limit) || 50))
+  let query = supabase.from('appointments')
+    .select('*, customers(name, phone)')
+    .eq('business_id', businessId)
+    .order('appointment_time', { ascending: false })
+    .order('id', { ascending: false })
+    .limit(capped + 1)
+  if (filters.status)     query = query.eq('status', filters.status)
+  if (filters.customerId) query = query.eq('customer_id', filters.customerId)
+  if (filters.service)    query = query.eq('service', filters.service)
+  if (filters.from)       query = query.gte('appointment_time', filters.from)
+  if (filters.to)         query = query.lte('appointment_time', filters.to)
+  if (cursor) {
+    const { data: anchor } = await supabase.from('appointments').select('appointment_time, id').eq('id', cursor).single()
+    if (anchor) {
+      query = query.or(`appointment_time.lt.${anchor.appointment_time},and(appointment_time.eq.${anchor.appointment_time},id.lt.${anchor.id})`)
+    }
+  }
+  const { data } = await query
+  const rows = data || []
+  const hasMore = rows.length > capped
+  const page = hasMore ? rows.slice(0, capped) : rows
+  return { appointments: page, nextCursor: hasMore ? page[page.length - 1].id : null }
 }
 export async function updateAppointmentStatus(id, status) {
   const { error } = await supabase.from('appointments').update({ status }).eq('id', id)
@@ -170,12 +296,16 @@ export async function getOverduePayments(daysOverdue = 1) {
 
 // ── Stats ─────────────────────────────────────────────
 export async function getDashboardStats(businessId) {
-  const today = new Date().toISOString().split('T')[0]
+  const startOfDay = istMidnightUtc(istDateStr())
+  const endOfDay   = istEndOfDayUtc(istDateStr())
   const [appts, payments, messages, newCust] = await Promise.all([
-    supabase.from('appointments').select('id').eq('business_id', businessId).gte('appointment_time', `${today}T00:00:00`),
+    supabase.from('appointments').select('id').eq('business_id', businessId)
+      .gte('appointment_time', startOfDay).lte('appointment_time', endOfDay),
     supabase.from('payments').select('amount').eq('business_id', businessId).eq('status', 'pending'),
-    supabase.from('messages').select('id').eq('business_id', businessId).gte('created_at', `${today}T00:00:00`).eq('role', 'assistant'),
-    supabase.from('customers').select('id').eq('business_id', businessId).gte('created_at', `${today}T00:00:00`),
+    supabase.from('messages').select('id').eq('business_id', businessId)
+      .gte('created_at', startOfDay).lte('created_at', endOfDay).eq('role', 'assistant'),
+    supabase.from('customers').select('id').eq('business_id', businessId)
+      .gte('created_at', startOfDay).lte('created_at', endOfDay),
   ])
   const pendingAmount = (payments.data || []).reduce((s, p) => s + Number(p.amount), 0)
   return { todayAppointments: appts.data?.length || 0, pendingPayments: pendingAmount, aiRepliesToday: messages.data?.length || 0, newCustomersToday: newCust.data?.length || 0 }

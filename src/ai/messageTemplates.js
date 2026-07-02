@@ -1,7 +1,7 @@
 export function appointmentReminder(appt) {
   const dt   = new Date(appt.appointment_time)
-  const time = dt.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })
-  const date = dt.toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'short' })
+  const time = dt.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' })
+  const date = dt.toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'short', timeZone: 'Asia/Kolkata' })
   const name = appt.customers?.name ? ` ${appt.customers.name} ji` : ''
   return `📅 Reminder!\n\nNamaste${name}!\n\nAppointment at *${appt.businesses?.name}*:\n🕐 ${date} at ${time}\n💆 ${appt.service}\n\nPlease be on time! 🙏`
 }

@@ -1,12 +1,15 @@
 import { Router } from 'express'
 import {
   getDashboardStats, getTodayAppointments, getAllAppointments,
-  updateAppointmentStatus, getConversations, getMessages,
+  getAppointmentsPage, updateAppointmentStatus, getConversations,
+  getMessages, getMessagesPage,
   getPendingPayments, getAllCustomers, getOrCreateCustomer,
   createAppointment, supabase, saveMessage, normalizePhone
 } from '../config/database.js'
+import { validateBooking } from '../ai/validator.js'
 import { sendMessage } from '../services/whatsappService.js'
 import { appointmentReminder } from '../services/aiService.js'
+import { istDateStr, istMidnightUtc, istEndOfDayUtc } from '../utils/dateTime.js'
 
 export const dashboardRouter = Router()
 const bid = req => req.headers['x-business-id']
@@ -21,8 +24,28 @@ dashboardRouter.get('/stats', async (req, res) => {
 dashboardRouter.get('/appointments/today', async (req, res) => {
   res.json(await getTodayAppointments(bid(req)))
 })
+// Paginated list. Accepts ?cursor=<id>&limit=50 and optional filters:
+// ?status=confirmed&from=2026-07-01T00:00:00Z&to=2026-07-31T23:59:59Z
+// &customer_id=<uuid>&service=Facial
+// Response: { appointments: [...], nextCursor: <id|null> }
 dashboardRouter.get('/appointments', async (req, res) => {
-  res.json(await getAllAppointments(bid(req)))
+  const { cursor, limit, status, from, to, customer_id, service } = req.query
+  // Legacy consumers can request the old flat array with ?paginated=false
+  if (req.query.paginated === 'false') {
+    return res.json(await getAllAppointments(bid(req)))
+  }
+  const filters = {}
+  if (status) filters.status = String(status)
+  if (from)   filters.from = String(from)
+  if (to)     filters.to = String(to)
+  if (customer_id) filters.customerId = String(customer_id)
+  if (service) filters.service = String(service)
+  const page = await getAppointmentsPage(bid(req), {
+    cursor: cursor || null,
+    limit: limit ? Number(limit) : 50,
+    filters,
+  })
+  res.json(page)
 })
 dashboardRouter.patch('/appointments/:id', async (req, res) => {
   const { status } = req.body
@@ -44,6 +67,20 @@ dashboardRouter.post('/appointments/create', async (req, res) => {
   try {
     const phone    = customer_phone || `manual-${Date.now()}`
     const customer = await getOrCreateCustomer(businessId, phone, customer_name)
+
+    // Dashboard bookings go through the same validator as the AI path so a
+    // business owner can't manually create a slot that violates their own rules.
+    // We accept a full ISO string; split it into IST date+time for the validator.
+    if (appointment_time) {
+      const { data: business } = await supabase.from('businesses').select('*').eq('id', businessId).single()
+      const utc = new Date(appointment_time)
+      const ist = new Date(utc.getTime() + (5 * 60 + 30) * 60 * 1000)
+      const dateISO = ist.toISOString().slice(0, 10)
+      const hhmm    = ist.toISOString().slice(11, 16)
+      const check = await validateBooking({ business, customer, dateISO, hhmm, service })
+      if (!check.valid) return res.status(400).json({ error: check.error, code: check.code })
+    }
+
     const appt = await createAppointment({
       business_id: businessId, customer_id: customer.id,
       service: service || 'Appointment', appointment_time,
@@ -73,11 +110,12 @@ dashboardRouter.post('/appointments/remind-all', async (req, res) => {
   const businessId = bid(req)
   if (!businessId) return res.status(400).json({ error: 'x-business-id required' })
   try {
-    const today = new Date().toISOString().split('T')[0]   // same UTC boundary as getTodayAppointments
+    const today = istDateStr()
     const { data: appts } = await supabase.from('appointments')
       .select('*, customers(name, phone)')
       .eq('business_id', businessId).eq('status', 'confirmed')
-      .gte('appointment_time', `${today}T00:00:00`).lte('appointment_time', `${today}T23:59:59`)
+      .gte('appointment_time', istMidnightUtc(today))
+      .lte('appointment_time', istEndOfDayUtc(today))
       .order('appointment_time')
     const { data: business } = await supabase.from('businesses')
       .select('name, whatsapp_phone_id').eq('id', businessId).single()
@@ -106,11 +144,29 @@ dashboardRouter.post('/appointments/remind-all', async (req, res) => {
 })
 
 // ── Conversations ─────────────────────────────────────
+// Paginated. ?cursor=<customer_id>&limit=50&search=priya
+// Response: { conversations: [...], nextCursor: <id|null> }
 dashboardRouter.get('/conversations', async (req, res) => {
-  res.json(await getConversations(bid(req)))
+  const { cursor, limit, search } = req.query
+  const result = await getConversations(bid(req), {
+    cursor: cursor || null,
+    limit: limit ? Number(limit) : 50,
+    search: search || null,
+  })
+  res.json(result)
 })
+// Paginated messages for a single conversation.
+// ?cursor=<message_id>&limit=50
+// Legacy flat list preserved with ?paginated=false.
 dashboardRouter.get('/conversations/:cid/messages', async (req, res) => {
-  res.json(await getMessages(req.params.cid))
+  if (req.query.paginated === 'false') {
+    return res.json(await getMessages(req.params.cid))
+  }
+  const { cursor, limit } = req.query
+  res.json(await getMessagesPage(req.params.cid, {
+    cursor: cursor || null,
+    limit: limit ? Number(limit) : 50,
+  }))
 })
 // Manual reply from dashboard
 dashboardRouter.post('/conversations/:cid/send', async (req, res) => {
