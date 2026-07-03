@@ -17,6 +17,16 @@ import { securityHeaders } from './middleware/securityHeaders.js'
 import { startCronJobs } from './jobs/scheduler.js'
 import { requestLogger } from './middleware/logger.js'
 import { rateLimiter, tenantRateLimiter } from './middleware/rateLimiter.js'
+import { initSentry, captureError } from './config/monitoring.js'
+
+// Initialise error monitoring first (no-op unless SENTRY_DSN is set).
+initSentry()
+
+// An unhandled promise rejection would otherwise crash the process silently.
+process.on('unhandledRejection', (reason) => {
+  console.error('unhandledRejection:', reason)
+  captureError(reason, { kind: 'unhandledRejection' })
+})
 
 const app = express()
 const PORT = process.env.PORT || 3000
@@ -79,7 +89,7 @@ app.use('/api/admin',     rateLimiter, requireAdminAuth, adminRouter)
 
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'BizBot', time: new Date().toISOString() }))
 app.use((req, res) => res.status(404).json({ error: 'Route not found' }))
-app.use((err, req, res, next) => { console.error('❌', err.message); res.status(500).json({ error: 'Internal server error' }) })
+app.use((err, req, res, next) => { console.error('❌', err.message); captureError(err, { path: req.path, method: req.method }); res.status(500).json({ error: 'Internal server error' }) })
 
 const server = app.listen(PORT, () => {
   console.log(`\n🤖 BizBot backend running on port ${PORT}`)
