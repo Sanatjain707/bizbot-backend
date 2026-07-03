@@ -20,3 +20,13 @@ create table if not exists admin_audit_log (
 
 create index if not exists idx_admin_audit_created on admin_audit_log(created_at desc);
 create index if not exists idx_businesses_created  on businesses(created_at desc);
+
+-- Internal support notes an operator keeps against a client.
+create table if not exists support_notes (
+  id          uuid primary key default gen_random_uuid(),
+  business_id uuid not null references businesses(id) on delete cascade,
+  author      text not null,
+  body        text not null,
+  created_at  timestamptz not null default now()
+);
+create index if not exists idx_support_notes_biz on support_notes(business_id, created_at desc);

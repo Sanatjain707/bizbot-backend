@@ -116,22 +116,40 @@ adminRouter.get('/clients', async (req, res) => {
     }
 
     const { data } = await q
-    let rows = (data || []).map(b => {
-      const st = clientStatus(b)
-      const daysLeft = daysUntil(b.plan_expires_at)
-      return {
-        id: b.id, name: b.name, type: b.type, owner_name: b.owner_name, email: b.email,
-        plan: b.plan, plan_expires_at: b.plan_expires_at, waba_status: b.waba_status,
-        whatsapp_phone_id: b.whatsapp_phone_id, created_at: b.created_at,
-        status: st, daysLeft,
-        // Cheap at-risk heuristic; activity-based signal lands in Phase 2.
-        atRisk: st === 'expired' || (st === 'trial' && daysLeft !== null && daysLeft <= 5) || b.waba_status !== 'live',
-      }
-    })
+    let rows = (data || []).map(b => ({
+      id: b.id, name: b.name, type: b.type, owner_name: b.owner_name, email: b.email,
+      plan: b.plan, plan_expires_at: b.plan_expires_at, waba_status: b.waba_status,
+      whatsapp_phone_id: b.whatsapp_phone_id, created_at: b.created_at,
+      status: clientStatus(b), daysLeft: daysUntil(b.plan_expires_at),
+    }))
     if (status && status !== 'all') rows = rows.filter(r => r.status === status)
 
     const hasMore = rows.length > limit
     const page = hasMore ? rows.slice(0, limit) : rows
+
+    // Batched last-activity lookup for the page (one query, not N per client).
+    const ids = page.map(r => r.id)
+    const lastByBiz = new Map()
+    if (ids.length) {
+      const { data: recent } = await supabase.from('messages')
+        .select('business_id, created_at').in('business_id', ids)
+        .order('created_at', { ascending: false }).limit(ids.length * 4)
+      for (const m of recent || []) if (!lastByBiz.has(m.business_id)) lastByBiz.set(m.business_id, m.created_at)
+    }
+    for (const r of page) {
+      const last = lastByBiz.get(r.id) || null
+      const inactiveDays = last ? Math.floor((Date.now() - new Date(last).getTime()) / DAY) : null
+      const signupAge = r.created_at ? Math.floor((Date.now() - new Date(r.created_at).getTime()) / DAY) : 0
+      r.lastActivity = last
+      r.inactiveDays = inactiveDays
+      // At-risk = churn signals only (WABA-pending is shown separately as its
+      // own state, not churn). Expired, trial about to lapse, gone quiet, or
+      // signed up a week ago and never sent a message.
+      r.atRisk = r.status === 'expired'
+        || (r.status === 'trial' && r.daysLeft !== null && r.daysLeft <= 5)
+        || (inactiveDays !== null && inactiveDays >= 14)
+        || (inactiveDays === null && signupAge >= 7)
+    }
     res.json({ clients: page, nextCursor: hasMore ? page[page.length - 1].id : null })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -232,5 +250,55 @@ adminRouter.get('/alerts', async (req, res) => {
     const hasMore = rows.length > limit
     const page = hasMore ? rows.slice(0, limit) : rows
     res.json({ alerts: page, nextCursor: hasMore ? page[page.length - 1].id : null })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+// ── Audit log ─────────────────────────────────────────
+adminRouter.get('/audit', async (req, res) => {
+  try {
+    const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 100))
+    const { cursor } = req.query
+    let q = supabase.from('admin_audit_log')
+      .select('*, businesses(name)')
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: false })
+      .limit(limit + 1)
+    if (cursor) {
+      const { data: anchor } = await supabase.from('admin_audit_log').select('created_at, id').eq('id', cursor).single()
+      if (anchor) q = q.or(`created_at.lt.${anchor.created_at},and(created_at.eq.${anchor.created_at},id.lt.${anchor.id})`)
+    }
+    const { data } = await q
+    const rows = data || []
+    const hasMore = rows.length > limit
+    const page = hasMore ? rows.slice(0, limit) : rows
+    res.json({ entries: page, nextCursor: hasMore ? page[page.length - 1].id : null })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+// ── Support notes (internal, per client) ──────────────
+adminRouter.get('/clients/:id/notes', async (req, res) => {
+  try {
+    const { data } = await supabase.from('support_notes')
+      .select('*').eq('business_id', req.params.id)
+      .order('created_at', { ascending: false }).limit(100)
+    res.json({ notes: data || [] })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+adminRouter.post('/clients/:id/notes', async (req, res) => {
+  try {
+    const body = String(req.body?.body || '').trim()
+    if (!body) return res.status(400).json({ error: 'Note body required' })
+    const { data, error } = await supabase.from('support_notes')
+      .insert({ business_id: req.params.id, author: req.admin?.email || 'unknown', body })
+      .select().single()
+    if (error) return res.status(400).json({ error: error.message })
+    res.status(201).json(data)
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+adminRouter.delete('/notes/:noteId', async (req, res) => {
+  try {
+    const { error } = await supabase.from('support_notes').delete().eq('id', req.params.noteId)
+    if (error) return res.status(400).json({ error: error.message })
+    res.json({ success: true })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })

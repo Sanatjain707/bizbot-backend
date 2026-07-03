@@ -12,6 +12,7 @@
 // Toggle: AUTH_REQUIRED=false disables both — dev/migration only. Never in prod.
 
 import { supabase } from '../config/database.js'
+import { isAdminEmail } from './requireAdminAuth.js'
 
 const AUTH_REQUIRED = process.env.AUTH_REQUIRED !== 'false'
 
@@ -55,6 +56,14 @@ export async function requireBusinessAuth(req, res, next) {
   try {
     const user = await verifyJwt(req, res)
     if (!user) return
+
+    // Platform admins may access ANY tenant (operator impersonation / support).
+    // Trusted allowlist, and every session is initiated + audited from the admin
+    // console. We tag req.auth.impersonating so handlers/logs can tell it apart.
+    if (isAdminEmail(user.email)) {
+      req.auth = { userId: user.id, email: user.email, businessId, impersonating: true }
+      return next()
+    }
 
     // The business must belong to this user. Match by auth_user_id (primary)
     // or by email (legacy rows written before the column existed).
