@@ -8,6 +8,9 @@ export const adminRouter = Router()
 
 const DAY = 86400000
 
+// Monthly plan prices (INR). Trial = 0. Used for MRR on the overview.
+const PLAN_PRICE = { starter: 999, growth: 1999, pro: 3999 }
+
 // Write an audit row for a mutating action. Fire-and-forget: an audit hiccup
 // shouldn't fail the operation, but we log it.
 async function audit(req, action, targetBusinessId, detail = {}) {
@@ -68,8 +71,18 @@ adminRouter.get('/overview', async (req, res) => {
       supabase.from('customers').select('id', { count: 'exact', head: true }),
     ])
 
+    // MRR from currently-active paid clients (trial / expired / suspended excluded).
+    const byPlan = { starter: 0, growth: 0, pro: 0 }
+    let mrr = 0, payingClients = 0
+    for (const b of list) {
+      if (clientStatus(b) !== 'active') continue
+      const price = PLAN_PRICE[b.plan]
+      if (price) { byPlan[b.plan]++; mrr += price; payingClients++ }
+    }
+
     res.json({
       clients,
+      revenue: { mrr, payingClients, byPlan },
       expiringSoon,
       recentSignups,
       totals: { messages: messages || 0, appointments: appointments || 0, customers: customers || 0 },
@@ -193,5 +206,31 @@ adminRouter.patch('/clients/:id/status', async (req, res) => {
     if (error) return res.status(400).json({ error: error.message })
     await audit(req, 'status_change', req.params.id, update)
     res.json({ success: true, client: data })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+// ── Cross-tenant booking alerts ───────────────────────
+// Every "AI couldn't book" event across ALL clients, so the operator can spot
+// systemic AI-quality issues. Read-only here (the client owner resolves their
+// own alerts in their dashboard). Keyset-paginated. Returns { alerts, nextCursor }.
+adminRouter.get('/alerts', async (req, res) => {
+  try {
+    const { status, cursor } = req.query
+    const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 50))
+    let q = supabase.from('booking_alerts')
+      .select('*, businesses(name), customers(name, phone)')
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: false })
+      .limit(limit + 1)
+    if (status && status !== 'all') q = q.eq('status', status)
+    if (cursor) {
+      const { data: anchor } = await supabase.from('booking_alerts').select('created_at, id').eq('id', cursor).single()
+      if (anchor) q = q.or(`created_at.lt.${anchor.created_at},and(created_at.eq.${anchor.created_at},id.lt.${anchor.id})`)
+    }
+    const { data } = await q
+    const rows = data || []
+    const hasMore = rows.length > limit
+    const page = hasMore ? rows.slice(0, limit) : rows
+    res.json({ alerts: page, nextCursor: hasMore ? page[page.length - 1].id : null })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
