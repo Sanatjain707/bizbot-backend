@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { getBusinessById, updateBusiness, createBusiness, supabase } from '../config/database.js'
 import { requireUserAuth, requireBusinessAuth } from '../middleware/requireBusinessAuth.js'
+import { getWhatsAppProfile, updateWhatsAppProfile, updateProfilePhoto } from '../services/whatsappProfileService.js'
 
 export const businessRouter = Router()
 const bid = req => req.headers['x-business-id']
@@ -18,6 +19,30 @@ businessRouter.patch('/', requireBusinessAuth, async (req, res) => {
   const { data, error } = await updateBusiness(bid(req), safe)
   if (error) return res.status(400).json({ error: error.message })
   res.json(data)
+})
+
+// ── WhatsApp profile: display-name review status + business profile + logo ──
+businessRouter.get('/whatsapp-profile', requireBusinessAuth, async (req, res) => {
+  const biz = await getBusinessById(bid(req))
+  if (!biz) return res.status(404).json({ error: 'Business not found' })
+  res.json(await getWhatsAppProfile(biz))
+})
+businessRouter.patch('/whatsapp-profile', requireBusinessAuth, async (req, res) => {
+  const biz = await getBusinessById(bid(req))
+  if (!biz) return res.status(404).json({ error: 'Business not found' })
+  const { error } = await updateWhatsAppProfile(biz, req.body)
+  if (error) return res.status(400).json({ error })
+  res.json({ success: true })
+})
+businessRouter.post('/whatsapp-profile/photo', requireBusinessAuth, async (req, res) => {
+  const biz = await getBusinessById(bid(req))
+  if (!biz) return res.status(404).json({ error: 'Business not found' })
+  const { image, mimeType } = req.body || {}
+  if (!image) return res.status(400).json({ error: 'image (base64) required' })
+  const buffer = Buffer.from(String(image).replace(/^data:[^;]+;base64,/, ''), 'base64')
+  const { error } = await updateProfilePhoto(biz, buffer, mimeType || 'image/jpeg')
+  if (error) return res.status(400).json({ error })
+  res.json({ success: true })
 })
 
 // Create — the user must be logged in, but they don't have a business yet,
