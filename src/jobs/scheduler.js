@@ -3,6 +3,8 @@ import { getUpcomingForReminder, markReminderSent, getOverduePayments, markPayme
 import { sendMessage } from '../services/whatsappService.js'
 import { appointmentReminder, paymentReminder } from '../services/aiService.js'
 import { detectLanguage } from '../ai/messageTemplates.js'
+import { sendCampaign } from '../services/campaignService.js'
+import { isPlanActive } from '../services/billingService.js'
 
 // Pick the customer's language from their most recent inbound message.
 // Cheap: one query per reminder recipient, and reminders are hourly.
@@ -56,5 +58,21 @@ export function startCronJobs() {
     }
   }, null, true)
 
-  console.log('⏰ Cron jobs started: reminders (hourly) · payments (10am)')
+  // Scheduled broadcasts — every minute, send any campaign whose time has come.
+  new CronJob('* * * * *', async () => {
+    const { data: due } = await supabase.from('campaigns')
+      .select('*, businesses(*)')
+      .eq('status', 'scheduled')
+      .lte('scheduled_at', new Date().toISOString())
+    for (const camp of due || []) {
+      const business = camp.businesses
+      if (!business) continue
+      // The manual send route is plan-gated; the cron must enforce it too.
+      if (!isPlanActive(business)) { console.log(`Scheduled campaign ${camp.id} skipped — plan inactive`); continue }
+      try { await sendCampaign(business, camp.id) }
+      catch (err) { console.error(`Scheduled campaign ${camp.id} failed:`, err.message) }
+    }
+  }, null, true)
+
+  console.log('⏰ Cron jobs started: reminders (hourly) · payments (10am) · scheduled broadcasts (every minute)')
 }

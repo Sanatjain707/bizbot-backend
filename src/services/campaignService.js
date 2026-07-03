@@ -1,7 +1,7 @@
 import 'dotenv/config'
 import axios from 'axios'
 import { supabase, normalizePhone } from '../config/database.js'
-import { getTemplateById } from './templateService.js'
+import { getTemplateById, varCount } from './templateService.js'
 
 const GRAPH = 'https://graph.facebook.com/v19.0'
 // Approx Meta marketing message cost in India (₹). Adjust as Meta's rates change.
@@ -49,14 +49,27 @@ export async function createCampaign(businessId, { name, template_id, segment, s
 }
 
 // ── Build the WhatsApp template payload ───────────────
+// Every {{n}} in the template MUST get a parameter or Meta rejects the send
+// with a count mismatch. Convention for broadcasts: body {{1}} = the customer's
+// name; {{2}}.. and the header variable = the template's stored example values
+// (broadcast constants like an offer or amount).
 function buildTemplatePayload(toPhone, template, customer) {
-  // Replace {{1}} with customer name as a simple personalization
-  const params = []
-  if (template.body && template.body.includes('{{1}}')) {
-    params.push({ type: 'text', text: customer.name || 'there' })
-  }
+  const ex = template.variable_examples || {}
+  const nHeader = varCount(template.header)
+  const nBody   = varCount(template.body)
   const components = []
-  if (params.length) components.push({ type: 'body', parameters: params })
+
+  if (nHeader > 0) {
+    components.push({ type: 'header', parameters: [{ type: 'text', text: String(ex.header || ' ') }] })
+  }
+  if (nBody > 0) {
+    const params = []
+    for (let i = 1; i <= nBody; i++) {
+      const text = i === 1 ? (customer.name || 'there') : (ex.body?.[i - 1] || ' ')
+      params.push({ type: 'text', text: String(text) })
+    }
+    components.push({ type: 'body', parameters: params })
+  }
 
   return {
     messaging_product: 'whatsapp',
@@ -72,14 +85,19 @@ function buildTemplatePayload(toPhone, template, customer) {
 
 // ── Send a campaign now ───────────────────────────────
 export async function sendCampaign(business, campaignId) {
-  const { data: campaign } = await supabase.from('campaigns').select('*').eq('id', campaignId).single()
+  const { data: campaign } = await supabase.from('campaigns').select('*').eq('id', campaignId).eq('business_id', business.id).single()
   if (!campaign) throw new Error('Campaign not found')
 
   const template = await getTemplateById(campaign.template_id)
   if (!template) throw new Error('Template not found')
   if (template.status !== 'APPROVED') throw new Error('Template is not approved yet')
 
-  await supabase.from('campaigns').update({ status: 'sending' }).eq('id', campaignId)
+  // Atomically claim the campaign — only proceed if it's still draft/scheduled.
+  // Prevents a double-send from a double-click or a scheduler+manual overlap.
+  const { data: claimed } = await supabase.from('campaigns')
+    .update({ status: 'sending' })
+    .eq('id', campaignId).in('status', ['draft', 'scheduled']).select('id')
+  if (!claimed || !claimed.length) return { skipped: true, reason: 'already sending or sent' }
 
   const audience = await resolveAudience(business.id, campaign.segment, campaign.segment_value)
   const phoneId  = business.whatsapp_phone_id || process.env.WHATSAPP_PHONE_ID
@@ -122,6 +140,28 @@ export async function listCampaigns(businessId) {
     .select('*, templates(name)').eq('business_id', businessId)
     .order('created_at', { ascending: false })
   return data || []
+}
+
+// ── Pre-send validation (fast, synchronous) ───────────
+// Lets the route give immediate feedback before backgrounding the actual blast.
+export async function validateCampaignSendable(businessId, campaignId) {
+  const { data: c } = await supabase.from('campaigns').select('*').eq('id', campaignId).eq('business_id', businessId).single()
+  if (!c) return { error: 'Campaign not found' }
+  if (!['draft', 'scheduled'].includes(c.status)) return { error: `Campaign is already ${c.status}` }
+  const t = await getTemplateById(c.template_id)
+  if (!t) return { error: 'Template not found' }
+  if (t.status !== 'APPROVED') return { error: 'Template is not approved yet' }
+  const audience = await resolveAudience(businessId, c.segment, c.segment_value)
+  return { error: null, total: audience.length }
+}
+
+// ── Cancel a draft/scheduled campaign ─────────────────
+export async function cancelCampaign(businessId, campaignId) {
+  const { data } = await supabase.from('campaigns')
+    .update({ status: 'cancelled' })
+    .eq('id', campaignId).eq('business_id', businessId).in('status', ['draft', 'scheduled']).select('id')
+  if (!data || !data.length) return { error: 'Only a draft or scheduled campaign can be cancelled' }
+  return { error: null }
 }
 
 // ── Update recipient + campaign counters from a status webhook ──

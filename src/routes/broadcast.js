@@ -4,7 +4,8 @@ import {
   createTemplate, listTemplates, refreshTemplateStatuses, deleteTemplate
 } from '../services/templateService.js'
 import {
-  createCampaign, sendCampaign, listCampaigns, resolveAudience, estimateCost
+  createCampaign, sendCampaign, listCampaigns, resolveAudience, estimateCost,
+  validateCampaignSendable, cancelCampaign
 } from '../services/campaignService.js'
 
 export const broadcastRouter = Router()
@@ -59,9 +60,20 @@ broadcastRouter.post('/campaigns/:id/send', async (req, res) => {
   const business = await getBusinessById(bid(req))
   if (!business) return res.status(404).json({ error: 'Business not found' })
   try {
-    const result = await sendCampaign(business, req.params.id)
-    res.json(result)
+    // Validate synchronously so the user gets immediate feedback (unapproved
+    // template, already sent, etc.), then run the blast in the background —
+    // a large audience would otherwise exceed the request timeout.
+    const check = await validateCampaignSendable(business.id, req.params.id)
+    if (check.error) return res.status(400).json({ error: check.error })
+    sendCampaign(business, req.params.id).catch(err => console.error('campaign send failed:', err.message))
+    res.status(202).json({ accepted: true, total: check.total })
   } catch (err) {
     res.status(400).json({ error: err.message })
   }
+})
+
+broadcastRouter.post('/campaigns/:id/cancel', async (req, res) => {
+  const { error } = await cancelCampaign(bid(req), req.params.id)
+  if (error) return res.status(400).json({ error })
+  res.json({ success: true })
 })
