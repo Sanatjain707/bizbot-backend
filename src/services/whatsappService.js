@@ -38,7 +38,8 @@ export function parseWebhook(body) {
       return {
         isStatus: true,
         waMessageId: s.id,
-        status: s.status, // sent | delivered | read | failed
+        status: s.status,      // sent | delivered | read | failed
+        pricing: s.pricing || null, // { billable, pricing_model, category } — Meta's actual billing
       }
     }
 

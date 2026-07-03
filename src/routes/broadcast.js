@@ -5,7 +5,7 @@ import {
 } from '../services/templateService.js'
 import {
   createCampaign, sendCampaign, listCampaigns, resolveAudience, estimateCost,
-  validateCampaignSendable, cancelCampaign
+  validateCampaignSendable, cancelCampaign, RATES_INR
 } from '../services/campaignService.js'
 
 export const broadcastRouter = Router()
@@ -39,9 +39,10 @@ broadcastRouter.delete('/templates/:id', async (req, res) => {
 
 // ── Audience preview (count + cost before sending) ────
 broadcastRouter.get('/audience', async (req, res) => {
-  const { segment = 'all', value } = req.query
+  const { segment = 'all', value, category } = req.query
   const audience = await resolveAudience(bid(req), segment, value)
-  res.json({ count: audience.length, estCost: estimateCost(audience.length) })
+  const cat = String(category || 'marketing').toLowerCase()
+  res.json({ count: audience.length, estCost: estimateCost(audience.length, cat), category: cat, rates: RATES_INR })
 })
 
 // ── Campaigns ─────────────────────────────────────────

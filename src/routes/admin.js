@@ -80,12 +80,19 @@ adminRouter.get('/overview', async (req, res) => {
       if (price) { byPlan[b.plan]++; mrr += price; payingClients++ }
     }
 
+    // Actual WhatsApp spend across all clients in the last 30 days (from the
+    // per-message billing captured off Meta's webhooks). Returns 0 gracefully
+    // if the cost migration hasn't run yet.
+    const since = new Date(Date.now() - 30 * DAY).toISOString()
+    const { data: recentCamps } = await supabase.from('campaigns').select('actual_cost').gte('sent_at', since)
+    const whatsappSpend30d = Math.round((recentCamps || []).reduce((s, c) => s + Number(c.actual_cost || 0), 0) * 100) / 100
+
     res.json({
       clients,
       revenue: { mrr, payingClients, byPlan },
       expiringSoon,
       recentSignups,
-      totals: { messages: messages || 0, appointments: appointments || 0, customers: customers || 0 },
+      totals: { messages: messages || 0, appointments: appointments || 0, customers: customers || 0, whatsappSpend30d },
     })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })

@@ -58,7 +58,7 @@ whatsappRouter.post('/', async (req, res) => {
     res.sendStatus(200)
     try {
       if (['sent', 'delivered', 'read'].includes(msg.status)) {
-        await applyStatusUpdate(msg.waMessageId, msg.status)
+        await applyStatusUpdate(msg.waMessageId, msg.status, msg.pricing)
       }
     } catch (e) { /* ignore */ }
     return
