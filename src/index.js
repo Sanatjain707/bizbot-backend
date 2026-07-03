@@ -9,8 +9,10 @@ import { billingRouter } from './routes/billing.js'
 import { demoRouter } from './routes/demo.js'
 import { broadcastRouter } from './routes/broadcast.js'
 import { analyticsRouter } from './routes/analytics.js'
+import { adminRouter } from './routes/admin.js'
 import { requireActivePlan } from './middleware/requireActivePlan.js'
 import { requireBusinessAuth } from './middleware/requireBusinessAuth.js'
+import { requireAdminAuth } from './middleware/requireAdminAuth.js'
 import { securityHeaders } from './middleware/securityHeaders.js'
 import { startCronJobs } from './jobs/scheduler.js'
 import { requestLogger } from './middleware/logger.js'
@@ -72,6 +74,8 @@ app.use('/api/billing',   rateLimiter, tenantRateLimiter, billingRouter)
 app.use('/api/demo',      rateLimiter, demoRouter)
 app.use('/api/broadcast', rateLimiter, requireBusinessAuth, tenantRateLimiter, requireActivePlan, broadcastRouter)
 app.use('/api/analytics', rateLimiter, requireBusinessAuth, tenantRateLimiter, analyticsRouter)
+// Operator console — cross-tenant, gated by the ADMIN_EMAILS allowlist (not requireBusinessAuth)
+app.use('/api/admin',     rateLimiter, requireAdminAuth, adminRouter)
 
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'BizBot', time: new Date().toISOString() }))
 app.use((req, res) => res.status(404).json({ error: 'Route not found' }))

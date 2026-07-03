@@ -171,6 +171,9 @@ export async function fetchPaymentLink(linkId) {
 
 // ── Check if plan is active ───────────────────────────
 export function isPlanActive(business) {
+  // A platform admin can suspend a business from the operator console — the AI
+  // stops replying regardless of plan/expiry.
+  if (business.suspended) return false
   if (!business.plan_expires_at) return false
   return new Date(business.plan_expires_at) > new Date()
 }
