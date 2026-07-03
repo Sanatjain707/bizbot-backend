@@ -66,22 +66,23 @@ export async function processMessage(business, customer, userMessage, opts = {})
     const reply = await callGroq(systemPrompt, recent, userMessage)
     if (!reply) throw new Error('Empty response from Groq')
 
-    await saveMessage(business.id, customer.id, 'assistant', reply)
     const outcome = await tryExtractAppointment(business, customer, userMessage, reply)
 
-    // If the LLM said "✅ Booked" but the validator refused (capacity, holiday,
-    // conflict, etc.), send a correction so the customer isn't misled.
-    let correction = null
+    // If the validator refused the booking (capacity, holiday, conflict, etc.),
+    // the LLM's "✅ Booked" reply is misleading. Replace it entirely with the
+    // rejection message — save/send the rejection instead of the false ✅ — so
+    // the customer never sees a confirm-then-cancel sequence.
     if (outcome?.status === 'rejected') {
-      // Match the customer's language so the correction doesn't feel jarring
-      // after an English AI reply.
       const lang = detectLanguage(userMessage)
-      correction = bookingRejectedMessage(outcome.code, outcome.slot, business, lang)
-      await saveMessage(business.id, customer.id, 'assistant', correction)
+      const rejection = bookingRejectedMessage(outcome.code, outcome.slot, business, lang)
+      await saveMessage(business.id, customer.id, 'assistant', rejection)
+      console.log('Booking rejected by validator — sent rejection instead of the confirmation')
+      return { reply: rejection, correction: null }
     }
 
-    console.log('✅ Groq replied')
-    return { reply, correction }
+    await saveMessage(business.id, customer.id, 'assistant', reply)
+    console.log('Groq replied')
+    return { reply, correction: null }
 
   } catch (err) {
     console.error('❌ Groq call failed:', err.message)
