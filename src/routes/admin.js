@@ -302,3 +302,44 @@ adminRouter.delete('/notes/:noteId', async (req, res) => {
     res.json({ success: true })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
+
+// ── Delete a client and ALL associated data (irreversible) ──
+// customers/messages/appointments/payments/support_notes cascade from the
+// businesses row. We explicitly clear tables that may NOT cascade first
+// (booking_alerts, broadcast tables), then delete the business. Audit-logged.
+adminRouter.delete('/clients/:id', async (req, res) => {
+  const id = req.params.id
+  try {
+    const { data: biz } = await supabase.from('businesses').select('id, name').eq('id', id).single()
+    if (!biz) return res.status(404).json({ error: 'Client not found' })
+
+    const cnt = async (t) => (await supabase.from(t).select('id', { count: 'exact', head: true }).eq('business_id', id)).count || 0
+    const deleted = {
+      customers:    await cnt('customers'),
+      messages:     await cnt('messages'),
+      appointments: await cnt('appointments'),
+      payments:     await cnt('payments'),
+    }
+
+    // Best-effort clear of tables that may lack ON DELETE CASCADE (or not exist
+    // on every deployment). Failures here are non-fatal.
+    const safeDel = async (fn) => { try { await fn() } catch (_) {} }
+    await safeDel(() => supabase.from('booking_alerts').delete().eq('business_id', id))
+    await safeDel(() => supabase.from('support_notes').delete().eq('business_id', id))
+    await safeDel(async () => {
+      const { data: camps } = await supabase.from('campaigns').select('id').eq('business_id', id)
+      const ids = (camps || []).map(c => c.id)
+      if (ids.length) await supabase.from('campaign_recipients').delete().in('campaign_id', ids)
+      await supabase.from('campaigns').delete().eq('business_id', id)
+    })
+    await safeDel(() => supabase.from('templates').delete().eq('business_id', id))
+
+    // Delete the business — cascades customers → messages/appointments/payments.
+    const { error } = await supabase.from('businesses').delete().eq('id', id)
+    if (error) return res.status(400).json({ error: error.message })
+
+    // target_business_id must be null (the row is gone) — keep the id in detail.
+    await audit(req, 'client_deleted', null, { business_id: id, name: biz.name, deleted })
+    res.json({ success: true, deleted })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
