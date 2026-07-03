@@ -27,13 +27,10 @@ const bid = req => req.headers['x-business-id']
 // ── Stats ─────────────────────────────────────────────
 dashboardRouter.get('/stats', async (req, res) => {
   if (!bid(req)) return res.status(400).json({ error: 'x-business-id required' })
-  const [stats, openAlerts] = await Promise.all([
-    getDashboardStats(bid(req)),
-    countOpenBookingAlerts(bid(req)),
-  ])
-  // openAlerts joined here so the dashboard overview can render a badge
-  // without a second roundtrip.
-  res.json({ ...stats, openAlerts })
+  // openAlerts was joined here for an overview badge that no frontend consumes —
+  // the sidebar gets its count from /booking-alerts/count. Dropped the redundant
+  // per-stats query. Re-add if an overview badge is built.
+  res.json(await getDashboardStats(bid(req)))
 })
 
 // ── Booking alerts ────────────────────────────────────
