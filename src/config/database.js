@@ -1,5 +1,6 @@
 import 'dotenv/config'
 import { createClient } from '@supabase/supabase-js'
+import { istDateStr, istMidnightUtc, istEndOfDayUtc } from '../utils/dateTime.js'
 
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
   throw new Error('❌ Missing SUPABASE_URL or SUPABASE_SERVICE_KEY in .env')
@@ -41,21 +42,42 @@ export async function createBusiness(fields) {
 // ── Customers ─────────────────────────────────────────
 export async function getOrCreateCustomer(businessId, phone, name = null) {
   const normPhone = normalizePhone(phone)
-  let { data } = await supabase.from('customers').select('*').eq('business_id', businessId).eq('phone', normPhone).single()
-  if (data) {
-    const update = { last_seen: new Date().toISOString() }
-    if (name && !data.name) update.name = name  // fill name if we now have one
-    await supabase.from('customers').update(update).eq('id', data.id)
-    return data
+  const now = new Date().toISOString()
+
+  const { data: existing } = await supabase.from('customers').select('*')
+    .eq('business_id', businessId).eq('phone', normPhone).maybeSingle()
+  if (existing) {
+    const update = { last_seen: now }
+    if (name && !existing.name) update.name = name
+    await supabase.from('customers').update(update).eq('id', existing.id)
+    return existing
   }
-  const { data: created } = await supabase.from('customers').insert({ business_id: businessId, phone: normPhone, name, last_seen: new Date().toISOString() }).select().single()
-  return created
+  // Race-safe insert: unique(business_id, phone) means a concurrent webhook
+  // for the same phone can beat us to the INSERT. Use upsert so both callers
+  // succeed and get the same row back.
+  const { data: upserted, error } = await supabase.from('customers')
+    .upsert({ business_id: businessId, phone: normPhone, name, last_seen: now },
+             { onConflict: 'business_id,phone' })
+    .select().single()
+  if (error) {
+    // Fallback: another writer just created the row → re-SELECT.
+    const { data: raced } = await supabase.from('customers').select('*')
+      .eq('business_id', businessId).eq('phone', normPhone).maybeSingle()
+    return raced
+  }
+  return upserted
 }
 export async function updateCustomerName(id, name) {
   await supabase.from('customers').update({ name }).eq('id', id)
 }
-export async function getAllCustomers(businessId) {
-  const { data } = await supabase.from('customers').select('*').eq('business_id', businessId).order('last_seen', { ascending: false })
+export async function getAllCustomers(businessId, { limit = 500 } = {}) {
+  // Hard cap so the endpoint stays responsive as data grows. For fuller
+  // lists callers should paginate (add a cursor helper if you need it).
+  const capped = Math.max(1, Math.min(2000, Number(limit) || 500))
+  const { data } = await supabase.from('customers').select('*')
+    .eq('business_id', businessId)
+    .order('last_seen', { ascending: false })
+    .limit(capped)
   return data || []
 }
 export async function getCustomerAIEnabled(customerId) {
@@ -74,19 +96,121 @@ export async function getHistory(customerId, limit = 12) {
   const { data } = await supabase.from('messages').select('role, content').eq('customer_id', customerId).order('created_at', { ascending: false }).limit(limit)
   return (data || []).reverse()
 }
-export async function getConversations(businessId) {
-  const { data: customers } = await supabase.from('customers').select('id, name, phone, last_seen, ai_enabled').eq('business_id', businessId).order('last_seen', { ascending: false }).limit(50)
-  if (!customers) return []
-  const result = []
-  for (const c of customers) {
-    const { data: msgs } = await supabase.from('messages').select('role, content, created_at').eq('customer_id', c.id).order('created_at', { ascending: false }).limit(1)
-    result.push({ id: c.id, phone: c.phone, name: c.name, ai_enabled: c.ai_enabled !== false, last_msg: msgs?.[0]?.content?.slice(0, 60) || '', last_time: timeAgo(c.last_seen), unread: msgs?.[0]?.role === 'user' ? 1 : 0 })
+// ── Windowed history: recent verbatim + earlier turns to summarize ──
+// aiService uses this to keep the last N messages full-fidelity and roll
+// everything older into a cheap concat summary (fewer tokens per turn).
+export async function getHistoryWindow(customerId, recent = 6, lookback = 40) {
+  const { data } = await supabase.from('messages')
+    .select('role, content')
+    .eq('customer_id', customerId)
+    .order('created_at', { ascending: false })
+    .limit(lookback)
+  const chrono = (data || []).reverse()
+  if (chrono.length <= recent) return { recent: chrono, older: [] }
+  return {
+    recent: chrono.slice(-recent),
+    older:  chrono.slice(0, -recent),
   }
-  return result
 }
-export async function getMessages(customerId) {
-  const { data } = await supabase.from('messages').select('*').eq('customer_id', customerId).order('created_at', { ascending: true })
+export async function getConversations(businessId, { cursor = null, limit = 50, search = null } = {}) {
+  const capped = Math.max(1, Math.min(200, Number(limit) || 50))
+  let query = supabase.from('customers')
+    .select('id, name, phone, last_seen, ai_enabled')
+    .eq('business_id', businessId)
+    .order('last_seen', { ascending: false })
+    .order('id', { ascending: false })
+    .limit(capped + 1)
+  if (search) {
+    // PostgREST .or() treats , ( ) as delimiters and % _ as wildcards. Strip
+    // them from the caller-supplied string so the search input can't inject
+    // extra conditions or wildcard-match everything.
+    const s = String(search).trim().replace(/[,()%_*"]/g, '').slice(0, 60)
+    if (s) query = query.or(`name.ilike.%${s}%,phone.ilike.%${s}%`)
+  }
+  if (cursor) {
+    const { data: anchor } = await supabase.from('customers').select('last_seen, id').eq('id', cursor).single()
+    if (anchor) {
+      query = query.or(`last_seen.lt.${anchor.last_seen},and(last_seen.eq.${anchor.last_seen},id.lt.${anchor.id})`)
+    }
+  }
+  const { data: customers } = await query
+  const rows = customers || []
+  const hasMore = rows.length > capped
+  const page = hasMore ? rows.slice(0, capped) : rows
+
+  // ── Batch last-message lookup (was N+1: one query per customer) ──
+  // Pull the most recent ~N*4 messages across the whole page in a single
+  // query, then pick the newest per customer in JS. The 4× multiplier is a
+  // safety margin so a chatty customer doesn't crowd out someone quieter.
+  const customerIds = page.map(c => c.id)
+  const lastByCustomer = new Map()
+  if (customerIds.length) {
+    const { data: recent } = await supabase.from('messages')
+      .select('customer_id, role, content, created_at')
+      .in('customer_id', customerIds)
+      .order('created_at', { ascending: false })
+      .limit(customerIds.length * 4)
+    for (const m of recent || []) {
+      if (!lastByCustomer.has(m.customer_id)) lastByCustomer.set(m.customer_id, m)
+    }
+    // Anyone missed by the safety window (very rare) gets one small fallback query.
+    const missing = customerIds.filter(id => !lastByCustomer.has(id))
+    for (const id of missing) {
+      const { data: msgs } = await supabase.from('messages')
+        .select('role, content, created_at')
+        .eq('customer_id', id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+      if (msgs?.[0]) lastByCustomer.set(id, msgs[0])
+    }
+  }
+
+  const result = page.map(c => {
+    const last = lastByCustomer.get(c.id)
+    return {
+      id: c.id, phone: c.phone, name: c.name,
+      ai_enabled: c.ai_enabled !== false,
+      last_msg:  last?.content?.slice(0, 60) || '',
+      last_time: timeAgo(c.last_seen),
+      unread:    last?.role === 'user' ? 1 : 0,
+    }
+  })
+  return { conversations: result, nextCursor: hasMore ? page[page.length - 1].id : null }
+}
+export async function getMessages(customerId, { limit = 500 } = {}) {
+  // Cap the legacy full-thread read. Long conversations should use
+  // getMessagesPage instead — this endpoint stays as an escape hatch.
+  const capped = Math.max(1, Math.min(2000, Number(limit) || 500))
+  const { data } = await supabase.from('messages').select('*')
+    .eq('customer_id', customerId)
+    .order('created_at', { ascending: true })
+    .limit(capped)
   return data || []
+}
+// ── Cursor-paginated messages ─────────────────────────
+// Newest-first, keyset paginated. `cursor` is the `id` of the last row from
+// the previous page; caller passes it back to get the next slice. Returns
+// { messages, nextCursor: null | 'uuid' }.
+export async function getMessagesPage(customerId, { cursor = null, limit = 50 } = {}) {
+  const capped = Math.max(1, Math.min(200, Number(limit) || 50))
+  let query = supabase.from('messages')
+    .select('id, role, content, created_at')
+    .eq('customer_id', customerId)
+    .order('created_at', { ascending: false })
+    .order('id', { ascending: false })
+    .limit(capped + 1)
+  if (cursor) {
+    // Fetch the cursor row's timestamp so we can seek past it.
+    const { data: anchor } = await supabase.from('messages').select('created_at, id').eq('id', cursor).single()
+    if (anchor) {
+      query = query.or(`created_at.lt.${anchor.created_at},and(created_at.eq.${anchor.created_at},id.lt.${anchor.id})`)
+    }
+  }
+  const { data } = await query
+  const rows = data || []
+  const hasMore = rows.length > capped
+  const page = hasMore ? rows.slice(0, capped) : rows
+  return { messages: page, nextCursor: hasMore ? page[page.length - 1].id : null }
 }
 
 // ── Appointments ──────────────────────────────────────
@@ -115,16 +239,57 @@ export async function cancelAppointment(id) {
   await supabase.from('appointments').update({ status: 'cancelled' }).eq('id', id)
 }
 export async function getTodayAppointments(businessId) {
-  const today = new Date().toISOString().split('T')[0]
-  const { data } = await supabase.from('appointments').select('*, customers(name, phone)').eq('business_id', businessId).gte('appointment_time', `${today}T00:00:00`).lte('appointment_time', `${today}T23:59:59`).order('appointment_time')
+  const today = istDateStr()
+  const { data } = await supabase.from('appointments')
+    .select('*, customers(name, phone)')
+    .eq('business_id', businessId)
+    .gte('appointment_time', istMidnightUtc(today))
+    .lte('appointment_time', istEndOfDayUtc(today))
+    .order('appointment_time')
   return data || []
 }
-export async function getAllAppointments(businessId) {
-  const { data } = await supabase.from('appointments').select('*, customers(name, phone)').eq('business_id', businessId).order('appointment_time', { ascending: false })
+export async function getAllAppointments(businessId, { limit = 500 } = {}) {
+  const capped = Math.max(1, Math.min(2000, Number(limit) || 500))
+  const { data } = await supabase.from('appointments').select('*, customers(name, phone)')
+    .eq('business_id', businessId)
+    .order('appointment_time', { ascending: false })
+    .limit(capped)
   return data || []
 }
-export async function updateAppointmentStatus(id, status) {
-  const { error } = await supabase.from('appointments').update({ status }).eq('id', id)
+// ── Cursor-paginated appointments with filters ────────
+// filters: { status, from, to, customerId, service }
+export async function getAppointmentsPage(businessId, { cursor = null, limit = 50, filters = {} } = {}) {
+  const capped = Math.max(1, Math.min(200, Number(limit) || 50))
+  let query = supabase.from('appointments')
+    .select('*, customers(name, phone)')
+    .eq('business_id', businessId)
+    .order('appointment_time', { ascending: false })
+    .order('id', { ascending: false })
+    .limit(capped + 1)
+  if (filters.status)     query = query.eq('status', filters.status)
+  if (filters.customerId) query = query.eq('customer_id', filters.customerId)
+  if (filters.service)    query = query.eq('service', filters.service)
+  if (filters.from)       query = query.gte('appointment_time', filters.from)
+  if (filters.to)         query = query.lte('appointment_time', filters.to)
+  if (cursor) {
+    const { data: anchor } = await supabase.from('appointments').select('appointment_time, id').eq('id', cursor).single()
+    if (anchor) {
+      query = query.or(`appointment_time.lt.${anchor.appointment_time},and(appointment_time.eq.${anchor.appointment_time},id.lt.${anchor.id})`)
+    }
+  }
+  const { data } = await query
+  const rows = data || []
+  const hasMore = rows.length > capped
+  const page = hasMore ? rows.slice(0, capped) : rows
+  return { appointments: page, nextCursor: hasMore ? page[page.length - 1].id : null }
+}
+export async function updateAppointmentStatus(id, status, businessId = null) {
+  // Scope by business when the caller knows their id — prevents cross-tenant
+  // mutation via a guessed appointment UUID.
+  let q = supabase.from('appointments').update({ status }).eq('id', id)
+  if (businessId) q = q.eq('business_id', businessId)
+  const { error, count } = await q.select('id', { count: 'exact' })
+  if (!error && count === 0) return { error: { message: 'Not found or not owned by this business' } }
   return { error }
 }
 export async function getUpcomingForReminder(hoursAhead = 24) {
@@ -147,8 +312,12 @@ export async function getPaymentById(id) {
     .eq('id', id).single()
   return data
 }
-export async function getPendingPayments(businessId) {
-  const { data } = await supabase.from('payments').select('*, customers(name, phone)').eq('business_id', businessId).eq('status', 'pending').order('due_date')
+export async function getPendingPayments(businessId, { limit = 500 } = {}) {
+  const capped = Math.max(1, Math.min(2000, Number(limit) || 500))
+  const { data } = await supabase.from('payments').select('*, customers(name, phone)')
+    .eq('business_id', businessId).eq('status', 'pending')
+    .order('due_date')
+    .limit(capped)
   return data || []
 }
 export async function markPaymentPaid(id) {
@@ -170,15 +339,84 @@ export async function getOverduePayments(daysOverdue = 1) {
 
 // ── Stats ─────────────────────────────────────────────
 export async function getDashboardStats(businessId) {
-  const today = new Date().toISOString().split('T')[0]
+  const startOfDay = istMidnightUtc(istDateStr())
+  const endOfDay   = istEndOfDayUtc(istDateStr())
   const [appts, payments, messages, newCust] = await Promise.all([
-    supabase.from('appointments').select('id').eq('business_id', businessId).gte('appointment_time', `${today}T00:00:00`),
+    supabase.from('appointments').select('id').eq('business_id', businessId)
+      .gte('appointment_time', startOfDay).lte('appointment_time', endOfDay),
     supabase.from('payments').select('amount').eq('business_id', businessId).eq('status', 'pending'),
-    supabase.from('messages').select('id').eq('business_id', businessId).gte('created_at', `${today}T00:00:00`).eq('role', 'assistant'),
-    supabase.from('customers').select('id').eq('business_id', businessId).gte('created_at', `${today}T00:00:00`),
+    supabase.from('messages').select('id').eq('business_id', businessId)
+      .gte('created_at', startOfDay).lte('created_at', endOfDay).eq('role', 'assistant'),
+    supabase.from('customers').select('id').eq('business_id', businessId)
+      .gte('created_at', startOfDay).lte('created_at', endOfDay),
   ])
   const pendingAmount = (payments.data || []).reduce((s, p) => s + Number(p.amount), 0)
   return { todayAppointments: appts.data?.length || 0, pendingPayments: pendingAmount, aiRepliesToday: messages.data?.length || 0, newCustomersToday: newCust.data?.length || 0 }
+}
+
+// ── Booking-failure alerts ────────────────────────────
+// Recorded every time the extractor/validator can't complete a booking so
+// the business owner can act manually. `reason` maps to validator codes
+// (capacity_full, closed_day, holiday, past_datetime, outside_hours,
+// after_cutoff, unknown_service, duplicate, conflict, missing_datetime) or
+// pipeline codes (llm_error, extractor_failed, ambiguous).
+export async function createBookingAlert(fields) {
+  // Trim snippets so we don't store multi-KB payloads for every failed booking.
+  const clip = (s) => (s == null ? null : String(s).slice(0, 500))
+  const payload = {
+    business_id:       fields.business_id,
+    customer_id:       fields.customer_id,
+    reason:            fields.reason,
+    message_snippet:   clip(fields.message_snippet),
+    ai_reply_snippet:  clip(fields.ai_reply_snippet),
+    suggested_service: fields.suggested_service || null,
+    suggested_date:    fields.suggested_date || null,
+    suggested_time:    fields.suggested_time || null,
+  }
+  const { data, error } = await supabase.from('booking_alerts').insert(payload).select().single()
+  if (error) console.error('createBookingAlert failed:', error.message)
+  return { alert: data, error }
+}
+
+export async function getBookingAlerts(businessId, { status = 'open', limit = 50, cursor = null } = {}) {
+  const capped = Math.max(1, Math.min(200, Number(limit) || 50))
+  let q = supabase.from('booking_alerts')
+    .select('*, customers(name, phone)')
+    .eq('business_id', businessId)
+    .order('created_at', { ascending: false })
+    .order('id', { ascending: false })
+    .limit(capped + 1)
+  if (status && status !== 'all') q = q.eq('status', status)
+  if (cursor) {
+    const { data: anchor } = await supabase.from('booking_alerts').select('created_at, id').eq('id', cursor).single()
+    if (anchor) q = q.or(`created_at.lt.${anchor.created_at},and(created_at.eq.${anchor.created_at},id.lt.${anchor.id})`)
+  }
+  const { data } = await q
+  const rows = data || []
+  const hasMore = rows.length > capped
+  const page = hasMore ? rows.slice(0, capped) : rows
+  return { alerts: page, nextCursor: hasMore ? page[page.length - 1].id : null }
+}
+
+export async function countOpenBookingAlerts(businessId) {
+  const { count } = await supabase.from('booking_alerts')
+    .select('id', { count: 'exact', head: true })
+    .eq('business_id', businessId).eq('status', 'open')
+  return count || 0
+}
+
+export async function updateBookingAlertStatus(id, businessId, status) {
+  const { error } = await supabase.from('booking_alerts')
+    .update({ status, handled_at: new Date().toISOString() })
+    .eq('id', id).eq('business_id', businessId)
+  return { error }
+}
+
+export async function getBookingAlert(id, businessId) {
+  const { data } = await supabase.from('booking_alerts')
+    .select('*, customers(name, phone)')
+    .eq('id', id).eq('business_id', businessId).single()
+  return data
 }
 
 function timeAgo(date) {

@@ -1,88 +1,130 @@
-import {
-  createAppointment, updateCustomerName, getUpcomingAppointmentForCustomer,
-  rescheduleAppointment, cancelAppointment
-} from '../config/database.js'
-import { classifyAppointmentIntent } from './intentClassifier.js'
-import { tryCreatePayment } from './paymentManager.js'
-import {
-  isNonBookingIntent, parseAppointmentDateTime, shouldCancelAppointment,
-  shouldExtractAppointment
-} from './validator.js'
+// Conversation coordinator. Only decides *what* to do (book / reschedule /
+// cancel / nothing); the actual work is delegated to bookingService and
+// paymentService. Date resolution runs on the backend (dateResolver), not
+// the LLM — the classifier is only used as a hint when the resolver misses.
 
-// ── Handle appointment actions: cancel, reschedule, new + payment ──
+import { updateCustomerName, createBookingAlert } from '../config/database.js'
+import { classifyAppointmentIntent } from './intentClassifier.js'
+import { isNonBookingIntent, shouldCancelAppointment, shouldExtractAppointment } from './validator.js'
+import {
+  cancelUpcoming,
+  createBooking,
+  getUpcoming,
+  rescheduleBooking,
+} from '../services/bookingService.js'
+import { tryCreatePayment } from '../services/paymentService.js'
+import { resolveDateTime } from '../utils/dateResolver.js'
+
+// Record any failed-to-book case as an alert the business owner can act on
+// in the dashboard. Fire-and-forget — a DB hiccup here shouldn't take the
+// whole webhook down.
+function logAlert(business, customer, userMsg, aiReply, reason, slot) {
+  createBookingAlert({
+    business_id:       business.id,
+    customer_id:       customer.id,
+    reason,
+    message_snippet:   userMsg,
+    ai_reply_snippet:  aiReply,
+    suggested_service: slot?.service || null,
+    suggested_date:    slot?.date || null,
+    suggested_time:    slot?.time || null,
+  }).catch(err => console.warn('createBookingAlert failed (non-fatal):', err.message))
+}
+
+// ── Reconcile the backend resolver with the classifier ──
+// Backend resolver is authoritative for dates; classifier fills in the gaps
+// (mostly service name and the "reschedule vs book" intent).
+function mergeSlot(userMsg, classified) {
+  const resolved = resolveDateTime(userMsg)
+  return {
+    intent:  classified?.intent || 'book',
+    service: classified?.service || null,
+    name:    classified?.name || null,
+    date:    resolved.date || classified?.date || null,
+    time:    resolved.time || classified?.time || null,
+    source:  { resolved, classified },
+  }
+}
+
+// Returns one of:
+//   { status: 'ignored' }               — nothing to do (no markers, non-booking intent)
+//   { status: 'cancelled' }
+//   { status: 'created' | 'rescheduled', service }
+//   { status: 'rejected', code, reason, slot } — validator refused; caller
+//     should send a correction WhatsApp message so the ✅ the LLM already
+//     sent doesn't stand.
 export async function tryExtractAppointment(business, customer, userMsg, aiReply) {
-  // ── Cancellation ──
   if (shouldCancelAppointment(aiReply)) {
-    const existing = await getUpcomingAppointmentForCustomer(customer.id)
-    if (existing) {
-      await cancelAppointment(existing.id)
-      console.log('🗑️  Appointment cancelled')
-    }
-    return
+    const result = await cancelUpcoming(customer.id)
+    if (result.cancelled) console.log('🗑️  Appointment cancelled')
+    return { status: 'cancelled' }
   }
 
-  // ── Only proceed for confirmations ──
-  if (!shouldExtractAppointment(aiReply)) return
+  if (!shouldExtractAppointment(aiReply)) return { status: 'ignored' }
 
   try {
-    const parsed = await classifyAppointmentIntent(userMsg, aiReply)
-    if (!parsed) return
-    console.log(`📋 Appointment classifier intent: ${parsed.intent || 'unknown'}`)
+    const classified = await classifyAppointmentIntent(userMsg, aiReply)
+    if (!classified) return { status: 'ignored' }
+    console.log(`📋 Appointment classifier intent: ${classified.intent || 'unknown'}`)
 
-    // ── Ignore status questions and non-booking intents ──
-    if (isNonBookingIntent(parsed.intent)) {
+    if (isNonBookingIntent(classified.intent)) {
       console.log('ℹ️ Status query / non-booking — no appointment change')
-      return
+      return { status: 'ignored' }
     }
 
-    const dt = parseAppointmentDateTime(parsed)
-    if (!dt) {
-      if (parsed.date || parsed.time) console.warn('⚠️ Invalid date/time:', parsed.date, parsed.time)
-      return
+    const slot = mergeSlot(userMsg, classified)
+    if (!slot.date || !slot.time) {
+      console.warn('⚠️ Booking skipped — missing date/time after resolver+classifier merge:', slot.date, slot.time)
+      // The LLM said ✅ but neither the resolver nor the classifier could pin
+      // down a concrete date/time. Owner needs to see this and act manually.
+      logAlert(business, customer, userMsg, aiReply, 'ambiguous', slot)
+      return { status: 'ignored' }
     }
 
-    // Save the name if we just learned it
-    if (parsed.name && !customer.name) await updateCustomerName(customer.id, parsed.name)
+    if (slot.name && !customer.name) await updateCustomerName(customer.id, slot.name)
 
-    const existing = await getUpcomingAppointmentForCustomer(customer.id)
-
-    // ── Reschedule: update existing instead of creating duplicate ──
-    if (parsed.intent === 'reschedule' && existing) {
-      await rescheduleAppointment(existing.id, dt.toISOString())
-      console.log('🔄 Appointment rescheduled')
-      return
-    }
-
-    // ── Duplicate guard: same time already booked? skip ──
-    if (existing) {
-      const sameTime = Math.abs(new Date(existing.appointment_time).getTime() - dt.getTime()) < 60000
-      if (sameTime) {
-        console.log('ℹ️ Identical appointment already exists — skipping duplicate')
-        return
-      }
-      // If they have an upcoming one and this looks like the same service, treat as reschedule
-      if (existing.service === parsed.service) {
-        await rescheduleAppointment(existing.id, dt.toISOString())
-        console.log('🔄 Updated existing appointment')
-        return
+    if (slot.intent === 'reschedule') {
+      const existing = await getUpcoming(customer.id)
+      if (existing) {
+        const r = await rescheduleBooking({
+          business, customer, dateISO: slot.date, hhmm: slot.time, service: slot.service,
+        })
+        if (r.rescheduled) { console.log('🔄 Appointment rescheduled'); return { status: 'rescheduled' } }
+        console.warn(`⚠️ Reschedule rejected (${r.code}): ${r.reason}`)
+        logAlert(business, customer, userMsg, aiReply, r.code, slot)
+        return { status: 'rejected', code: r.code, reason: r.reason, slot }
       }
     }
 
-    // ── New appointment ──
-    await createAppointment({
-      business_id:      business.id,
-      customer_id:      customer.id,
-      service:          parsed.service || 'Appointment',
-      appointment_time: dt.toISOString(),
-      status:           'confirmed',
-      reminder_sent:    false
+    const existing = await getUpcoming(customer.id)
+    if (existing && existing.service === slot.service) {
+      const r = await rescheduleBooking({
+        business, customer, dateISO: slot.date, hhmm: slot.time, service: slot.service,
+      })
+      if (r.rescheduled) { console.log('🔄 Updated existing appointment'); return { status: 'rescheduled' } }
+      console.warn(`⚠️ Update rejected (${r.code}): ${r.reason}`)
+      logAlert(business, customer, userMsg, aiReply, r.code, slot)
+      return { status: 'rejected', code: r.code, reason: r.reason, slot }
+    }
+
+    const created = await createBooking({
+      business, customer, dateISO: slot.date, hhmm: slot.time, service: slot.service,
     })
+    if (!created.created) {
+      console.warn(`⚠️ Booking rejected (${created.code}): ${created.reason}`)
+      logAlert(business, customer, userMsg, aiReply, created.code, slot)
+      return { status: 'rejected', code: created.code, reason: created.reason, slot }
+    }
     console.log('📅 ✅ Appointment saved')
 
-    // ── Auto-create a pending payment for the service price ──
-    await tryCreatePayment(business, customer, parsed.service)
+    await tryCreatePayment(business, customer, slot.service)
+    return { status: 'created', service: slot.service }
 
   } catch (err) {
     console.error('⚠️ Appointment handling failed:', err.message)
+    // The pipeline itself blew up (classifier crashed, DB error, etc.).
+    // Owner needs to know so they can look at the raw thread.
+    logAlert(business, customer, userMsg, aiReply, 'extractor_failed', null)
+    return { status: 'ignored' }
   }
 }

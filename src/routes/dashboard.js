@@ -1,12 +1,25 @@
 import { Router } from 'express'
 import {
   getDashboardStats, getTodayAppointments, getAllAppointments,
-  updateAppointmentStatus, getConversations, getMessages,
+  getAppointmentsPage, updateAppointmentStatus, getConversations,
+  getMessages, getMessagesPage,
   getPendingPayments, getAllCustomers, getOrCreateCustomer,
-  createAppointment, supabase, saveMessage, normalizePhone
+  createAppointment, supabase, saveMessage, normalizePhone,
+  getBookingAlerts, countOpenBookingAlerts, updateBookingAlertStatus, getBookingAlert,
 } from '../config/database.js'
+import { validateBooking } from '../ai/validator.js'
 import { sendMessage } from '../services/whatsappService.js'
 import { appointmentReminder } from '../services/aiService.js'
+import { detectLanguage } from '../ai/messageTemplates.js'
+import { istDateStr, istMidnightUtc, istEndOfDayUtc } from '../utils/dateTime.js'
+
+// One query per customer — reminders are low-frequency, so this is fine.
+async function pickLang(customerId) {
+  const { data } = await supabase.from('messages')
+    .select('content').eq('customer_id', customerId).eq('role', 'user')
+    .order('created_at', { ascending: false }).limit(1)
+  return detectLanguage(data?.[0]?.content || '')
+}
 
 export const dashboardRouter = Router()
 const bid = req => req.headers['x-business-id']
@@ -14,27 +27,111 @@ const bid = req => req.headers['x-business-id']
 // ── Stats ─────────────────────────────────────────────
 dashboardRouter.get('/stats', async (req, res) => {
   if (!bid(req)) return res.status(400).json({ error: 'x-business-id required' })
+  // openAlerts was joined here for an overview badge that no frontend consumes —
+  // the sidebar gets its count from /booking-alerts/count. Dropped the redundant
+  // per-stats query. Re-add if an overview badge is built.
   res.json(await getDashboardStats(bid(req)))
+})
+
+// ── Booking alerts ────────────────────────────────────
+// Records of bookings the AI couldn't complete (validator rejection, LLM
+// error, ambiguous input). Owner uses these to close the loop manually.
+// ?status=open|handled|dismissed|all&limit=50&cursor=<id>
+dashboardRouter.get('/booking-alerts', async (req, res) => {
+  const { status, limit, cursor } = req.query
+  const result = await getBookingAlerts(bid(req), {
+    status: status || 'open',
+    limit:  limit ? Number(limit) : 50,
+    cursor: cursor || null,
+  })
+  res.json(result)
+})
+
+dashboardRouter.get('/booking-alerts/count', async (req, res) => {
+  res.json({ open: await countOpenBookingAlerts(bid(req)) })
+})
+
+// Mark handled (the owner acted on it) or dismissed (false alarm / ignore).
+dashboardRouter.patch('/booking-alerts/:id', async (req, res) => {
+  const businessId = bid(req)
+  const status = String(req.body?.status || '').trim()
+  if (!['handled', 'dismissed'].includes(status)) {
+    return res.status(400).json({ error: 'status must be handled or dismissed' })
+  }
+  const { error } = await updateBookingAlertStatus(req.params.id, businessId, status)
+  if (error) return res.status(400).json({ error: error.message })
+  res.json({ success: true })
+})
+
+// One-click "create the appointment the AI failed to book" — accepts the
+// same body as POST /appointments/create plus links back to the alert so
+// it gets marked handled automatically.
+dashboardRouter.post('/booking-alerts/:id/create-appointment', async (req, res) => {
+  const businessId = bid(req)
+  try {
+    const alert = await getBookingAlert(req.params.id, businessId)
+    if (!alert) return res.status(404).json({ error: 'Alert not found' })
+
+    const { customer_name, customer_phone, service, appointment_time, notes, status } = req.body
+    const phone = customer_phone || alert.customers?.phone || `manual-${Date.now()}`
+    const customer = await getOrCreateCustomer(businessId, phone, customer_name || alert.customers?.name)
+    const appt = await createAppointment({
+      business_id: businessId,
+      customer_id: customer.id,
+      service:     service || alert.suggested_service || 'Appointment',
+      appointment_time,
+      status:      status || 'confirmed',
+      reminder_sent: false,
+      notes: notes || null,
+    })
+    // Best-effort: don't fail the appointment if the alert update fails.
+    updateBookingAlertStatus(req.params.id, businessId, 'handled').catch(() => {})
+    res.status(201).json(appt)
+  } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
 // ── Appointments ──────────────────────────────────────
 dashboardRouter.get('/appointments/today', async (req, res) => {
   res.json(await getTodayAppointments(bid(req)))
 })
+// Paginated list. Accepts ?cursor=<id>&limit=50 and optional filters:
+// ?status=confirmed&from=2026-07-01T00:00:00Z&to=2026-07-31T23:59:59Z
+// &customer_id=<uuid>&service=Facial
+// Response: { appointments: [...], nextCursor: <id|null> }
 dashboardRouter.get('/appointments', async (req, res) => {
-  res.json(await getAllAppointments(bid(req)))
+  const { cursor, limit, status, from, to, customer_id, service } = req.query
+  // Legacy consumers can request the old flat array with ?paginated=false
+  if (req.query.paginated === 'false') {
+    return res.json(await getAllAppointments(bid(req)))
+  }
+  const filters = {}
+  if (status) filters.status = String(status)
+  if (from)   filters.from = String(from)
+  if (to)     filters.to = String(to)
+  if (customer_id) filters.customerId = String(customer_id)
+  if (service) filters.service = String(service)
+  const page = await getAppointmentsPage(bid(req), {
+    cursor: cursor || null,
+    limit: limit ? Number(limit) : 50,
+    filters,
+  })
+  res.json(page)
 })
 dashboardRouter.patch('/appointments/:id', async (req, res) => {
+  const businessId = bid(req)
   const { status } = req.body
-  // If marking done, increment customer visit count
-  if (status === 'done') {
-    const { data: appt } = await supabase.from('appointments').select('customer_id').eq('id', req.params.id).single()
-    if (appt?.customer_id) {
-      const { data: cust } = await supabase.from('customers').select('total_visits').eq('id', appt.customer_id).single()
-      await supabase.from('customers').update({ total_visits: (cust?.total_visits || 0) + 1 }).eq('id', appt.customer_id)
-    }
+  // Verify the appointment belongs to this business BEFORE any side-effects.
+  const { data: appt } = await supabase.from('appointments')
+    .select('customer_id, business_id').eq('id', req.params.id).single()
+  if (!appt || appt.business_id !== businessId) {
+    return res.status(404).json({ error: 'Appointment not found' })
   }
-  const { error } = await updateAppointmentStatus(req.params.id, status)
+  // If marking done, atomically bump visit count via SQL rather than read+write.
+  if (status === 'done' && appt.customer_id) {
+    await supabase.rpc('increment_customer_visits', { p_customer_id: appt.customer_id })
+      .catch(err => console.error('visit count bump failed:', err.message))
+  }
+  const { error } = await updateAppointmentStatus(req.params.id, status, businessId)
   if (error) return res.status(400).json({ error: error.message })
   res.json({ success: true })
 })
@@ -44,6 +141,20 @@ dashboardRouter.post('/appointments/create', async (req, res) => {
   try {
     const phone    = customer_phone || `manual-${Date.now()}`
     const customer = await getOrCreateCustomer(businessId, phone, customer_name)
+
+    // Dashboard bookings go through the same validator as the AI path so a
+    // business owner can't manually create a slot that violates their own rules.
+    // We accept a full ISO string; split it into IST date+time for the validator.
+    if (appointment_time) {
+      const { data: business } = await supabase.from('businesses').select('*').eq('id', businessId).single()
+      const utc = new Date(appointment_time)
+      const ist = new Date(utc.getTime() + (5 * 60 + 30) * 60 * 1000)
+      const dateISO = ist.toISOString().slice(0, 10)
+      const hhmm    = ist.toISOString().slice(11, 16)
+      const check = await validateBooking({ business, customer, dateISO, hhmm, service })
+      if (!check.valid) return res.status(400).json({ error: check.error, code: check.code })
+    }
+
     const appt = await createAppointment({
       business_id: businessId, customer_id: customer.id,
       service: service || 'Appointment', appointment_time,
@@ -53,12 +164,16 @@ dashboardRouter.post('/appointments/create', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 dashboardRouter.post('/appointments/:id/remind', async (req, res) => {
+  const businessId = bid(req)
   try {
+    // Scope by business_id so an attacker with a valid session can't
+    // trigger a reminder for another tenant's appointment.
     const { data: appt } = await supabase.from('appointments')
       .select('*, customers(name, phone), businesses(name, whatsapp_phone_id)')
-      .eq('id', req.params.id).single()
+      .eq('id', req.params.id).eq('business_id', businessId).single()
     if (!appt) return res.status(404).json({ error: 'Not found' })
-    const msg = appointmentReminder(appt)
+    const lang = await pickLang(appt.customer_id)
+    const msg = appointmentReminder(appt, lang)
     const result = await sendMessage(appt.customers.phone, msg, appt.businesses.whatsapp_phone_id)
     // Persist to the thread so the reminder shows in the conversation
     if (result.success) await saveMessage(appt.business_id, appt.customer_id, 'assistant', msg)
@@ -73,11 +188,12 @@ dashboardRouter.post('/appointments/remind-all', async (req, res) => {
   const businessId = bid(req)
   if (!businessId) return res.status(400).json({ error: 'x-business-id required' })
   try {
-    const today = new Date().toISOString().split('T')[0]   // same UTC boundary as getTodayAppointments
+    const today = istDateStr()
     const { data: appts } = await supabase.from('appointments')
       .select('*, customers(name, phone)')
       .eq('business_id', businessId).eq('status', 'confirmed')
-      .gte('appointment_time', `${today}T00:00:00`).lte('appointment_time', `${today}T23:59:59`)
+      .gte('appointment_time', istMidnightUtc(today))
+      .lte('appointment_time', istEndOfDayUtc(today))
       .order('appointment_time')
     const { data: business } = await supabase.from('businesses')
       .select('name, whatsapp_phone_id').eq('id', businessId).single()
@@ -95,7 +211,8 @@ dashboardRouter.post('/appointments/remind-all', async (req, res) => {
     for (const appt of recipients) {
       const phone = appt.customers?.phone
       if (!phone || !business?.whatsapp_phone_id) { otherFailed++; continue }
-      const msg = appointmentReminder({ ...appt, businesses: business })
+      const lang = await pickLang(appt.customer_id)
+      const msg = appointmentReminder({ ...appt, businesses: business }, lang)
       const r = await sendMessage(phone, msg, business.whatsapp_phone_id)
       if (r.success) { sent++; await saveMessage(businessId, appt.customer_id, 'assistant', msg) }
       else if (r.errorCode === 131047) windowFailed++    // outside the 24h service window
@@ -106,19 +223,45 @@ dashboardRouter.post('/appointments/remind-all', async (req, res) => {
 })
 
 // ── Conversations ─────────────────────────────────────
+// Paginated. ?cursor=<customer_id>&limit=50&search=priya
+// Response: { conversations: [...], nextCursor: <id|null> }
 dashboardRouter.get('/conversations', async (req, res) => {
-  res.json(await getConversations(bid(req)))
+  const { cursor, limit, search } = req.query
+  const result = await getConversations(bid(req), {
+    cursor: cursor || null,
+    limit: limit ? Number(limit) : 50,
+    search: search || null,
+  })
+  res.json(result)
 })
+// Paginated messages for a single conversation.
+// ?cursor=<message_id>&limit=50
+// Legacy flat list preserved with ?paginated=false.
 dashboardRouter.get('/conversations/:cid/messages', async (req, res) => {
-  res.json(await getMessages(req.params.cid))
+  const businessId = bid(req)
+  // Ownership check before reading messages — prevents cross-tenant thread reads.
+  const { data: owner } = await supabase.from('customers')
+    .select('id').eq('id', req.params.cid).eq('business_id', businessId).single()
+  if (!owner) return res.status(404).json({ error: 'Conversation not found' })
+
+  if (req.query.paginated === 'false') {
+    return res.json(await getMessages(req.params.cid))
+  }
+  const { cursor, limit } = req.query
+  res.json(await getMessagesPage(req.params.cid, {
+    cursor: cursor || null,
+    limit: limit ? Number(limit) : 50,
+  }))
 })
 // Manual reply from dashboard
 dashboardRouter.post('/conversations/:cid/send', async (req, res) => {
   const businessId = bid(req)
   const { text } = req.body
   try {
+    // Scope by business_id — otherwise User A can send a WhatsApp on behalf
+    // of Business B by supplying B's customer UUID.
     const { data: customer } = await supabase.from('customers')
-      .select('*, businesses(whatsapp_phone_id)').eq('id', req.params.cid).single()
+      .select('*, businesses(whatsapp_phone_id)').eq('id', req.params.cid).eq('business_id', businessId).single()
     if (!customer) return res.status(404).json({ error: 'Customer not found' })
 
     const phoneId = customer.businesses?.whatsapp_phone_id
@@ -159,9 +302,17 @@ dashboardRouter.get('/customers', async (req, res) => {
   res.json(await getAllCustomers(bid(req)))
 })
 dashboardRouter.get('/customers/:id', async (req, res) => {
-  const { data: customer } = await supabase.from('customers').select('*').eq('id', req.params.id).single()
-  const { data: appts }    = await supabase.from('appointments').select('*').eq('customer_id', req.params.id).order('appointment_time', { ascending: false })
-  const { data: payments } = await supabase.from('payments').select('*').eq('customer_id', req.params.id)
+  const businessId = bid(req)
+  // Scope every read by business_id — a customer UUID from another tenant
+  // used to return that customer's full profile + appointments + payments.
+  const { data: customer } = await supabase.from('customers').select('*')
+    .eq('id', req.params.id).eq('business_id', businessId).single()
+  if (!customer) return res.status(404).json({ error: 'Customer not found' })
+  const { data: appts }    = await supabase.from('appointments').select('*')
+    .eq('customer_id', req.params.id).eq('business_id', businessId)
+    .order('appointment_time', { ascending: false })
+  const { data: payments } = await supabase.from('payments').select('*')
+    .eq('customer_id', req.params.id).eq('business_id', businessId)
   res.json({ ...customer, appointments: appts || [], payments: payments || [] })
 })
 dashboardRouter.post('/customers/create', async (req, res) => {
@@ -262,12 +413,18 @@ dashboardRouter.delete('/customers/:id', async (req, res) => {
 })
 
 dashboardRouter.post('/customers/:id/reengage', async (req, res) => {
+  const businessId = bid(req)
   try {
+    // Ownership check — same class of hole as the other :id endpoints.
     const { data: customer } = await supabase.from('customers')
-      .select('*, businesses(name, whatsapp_phone_id)').eq('id', req.params.id).single()
+      .select('*, businesses(name, whatsapp_phone_id)').eq('id', req.params.id).eq('business_id', businessId).single()
     if (!customer) return res.status(404).json({ error: 'Not found' })
-    const name = customer.name ? `${customer.name} ji` : 'ji'
-    const msg  = `Namaste ${name}! 🙏\nHum aapko *${customer.businesses?.name}* mein miss kar rahe hain!\nAppointment book karni ho toh reply karein 😊`
+    const lang = await pickLang(customer.id)
+    const nameSuffix = lang === 'hi' ? ' ji' : ''
+    const namePart = customer.name ? `${customer.name}${nameSuffix}` : (lang === 'hi' ? 'ji' : 'there')
+    const msg = lang === 'en'
+      ? `Hi ${namePart}! 🙏\nWe miss you at *${customer.businesses?.name}*!\nReply if you'd like to book an appointment 😊`
+      : `Namaste ${namePart}! 🙏\nHum aapko *${customer.businesses?.name}* mein miss kar rahe hain!\nAppointment book karni ho toh reply karein 😊`
     const result = await sendMessage(customer.phone, msg, customer.businesses?.whatsapp_phone_id)
     if (result.success) {
       await supabase.from('customers').update({ reengagement_sent: true }).eq('id', req.params.id)
@@ -279,8 +436,13 @@ dashboardRouter.post('/customers/:id/reengage', async (req, res) => {
 
 // ── Toggle AI on/off for a conversation ───────────────
 dashboardRouter.patch('/conversations/:cid/ai', async (req, res) => {
+  const businessId = bid(req)
   const { ai_enabled } = req.body
-  const { error } = await supabase.from('customers').update({ ai_enabled }).eq('id', req.params.cid)
+  // Update MUST be scoped to this business — previously an attacker could
+  // silence another tenant's AI by supplying their customer UUID.
+  const { error } = await supabase.from('customers')
+    .update({ ai_enabled })
+    .eq('id', req.params.cid).eq('business_id', businessId)
   if (error) return res.status(400).json({ error: error.message })
   res.json({ success: true })
 })

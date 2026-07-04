@@ -1,12 +1,14 @@
 import { Router } from 'express'
 import { PLANS, createPaymentLink, createSubscription, verifyWebhookSignature, activatePlan, isPlanActive, fetchPaymentLink } from '../services/billingService.js'
 import { getBusinessById } from '../config/database.js'
+import { requireBusinessAuth } from '../middleware/requireBusinessAuth.js'
 
 export const billingRouter = Router()
 const bid = req => req.headers['x-business-id']
 
-// ── Get all plans + current plan status ───────────────
-billingRouter.get('/plans', async (req, res) => {
+// Plan definitions are semi-public metadata but coupling them to a
+// business's current plan means we need ownership on this endpoint.
+billingRouter.get('/plans', requireBusinessAuth, async (req, res) => {
   const businessId = bid(req)
   const business   = businessId ? await getBusinessById(businessId) : null
 
@@ -20,12 +22,12 @@ billingRouter.get('/plans', async (req, res) => {
   })
 })
 
-// ── Start checkout — payment link OR subscription ─────
-billingRouter.post('/checkout', async (req, res) => {
+// Checkout creates a real Razorpay link tied to a business. Was previously
+// open — an attacker with a UUID could create payment links against another
+// business's plan (they'd have to pay, so limited damage, but still wrong).
+billingRouter.post('/checkout', requireBusinessAuth, async (req, res) => {
   const businessId   = bid(req)
   const { plan, mode } = req.body // mode = 'one_time' | 'subscription'
-
-  if (!businessId) return res.status(400).json({ error: 'x-business-id required' })
   if (!PLANS[plan]) return res.status(400).json({ error: 'Invalid plan' })
 
   try {
@@ -51,7 +53,7 @@ billingRouter.post('/webhook', async (req, res) => {
   res.sendStatus(200) // respond immediately
 
   const signature = req.headers['x-razorpay-signature']
-  if (!verifyWebhookSignature(req.body, signature)) {
+  if (!verifyWebhookSignature(req.rawBody, signature)) {
     console.warn('❌ Invalid Razorpay webhook signature')
     return
   }
@@ -105,8 +107,9 @@ billingRouter.get('/callback', async (req, res) => {
   }
 })
 
-// ── Get current subscription status (frontend polls this) ──
-billingRouter.get('/status', async (req, res) => {
+// Subscription status is used by the frontend billing page — the polling
+// happens post-checkout, so the user is guaranteed to be logged in.
+billingRouter.get('/status', requireBusinessAuth, async (req, res) => {
   const businessId = bid(req)
   const business   = await getBusinessById(businessId)
   if (!business) return res.status(404).json({ error: 'Not found' })

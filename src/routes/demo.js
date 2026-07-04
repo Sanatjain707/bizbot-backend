@@ -54,5 +54,3 @@ demoRouter.post('/chat', async (req, res) => {
   }
 })
 
-// Light rate limit note: this is public, so cap message length
-demoRouter.use((req, res, next) => next())

@@ -12,6 +12,7 @@
     "dev": "node --watch src/index.js"
   },
   "dependencies": {
+    "@sentry/node": "^10.63.0",
     "@supabase/supabase-js": "^2.45.0",
     "axios": "^1.7.0",
     "cron": "^3.1.0",

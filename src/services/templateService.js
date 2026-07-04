@@ -10,14 +10,38 @@ function wabaId(business) {
   return business?.waba_id || process.env.WHATSAPP_WABA_ID
 }
 
+// Highest positional variable in a template string. "Hi {{1}}, {{2}} due" -> 2.
+// Meta uses positional {{1}}..{{n}} and REQUIRES an example for each when the
+// template is submitted — omitting them is an automatic rejection.
+export function varCount(text) {
+  let max = 0
+  for (const m of String(text || '').matchAll(/\{\{\s*(\d+)\s*\}\}/g)) max = Math.max(max, Number(m[1]))
+  return max
+}
+
 // ── Create a template on Meta + save locally as PENDING ──
-export async function createTemplate(business, { name, category, language, body, header, footer }) {
+export async function createTemplate(business, { name, category, language, body, header, footer, bodyExamples = [], headerExample = '' }) {
   // WhatsApp template names must be lowercase + underscores
   const safeName = name.toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 60)
 
+  const nBody = varCount(body)
+  const nHeader = varCount(header)
+
   const components = []
-  if (header) components.push({ type: 'HEADER', format: 'TEXT', text: header })
-  components.push({ type: 'BODY', text: body })
+  if (header) {
+    const h = { type: 'HEADER', format: 'TEXT', text: header }
+    // A TEXT header supports at most one variable ({{1}}).
+    if (nHeader > 0) h.example = { header_text: [String(headerExample || '').trim() || 'Example'] }
+    components.push(h)
+  }
+  const bodyComp = { type: 'BODY', text: body }
+  if (nBody > 0) {
+    // Meta wants a single example row: [[ex1, ex2, ...]] — one entry per {{n}}.
+    const exs = []
+    for (let i = 0; i < nBody; i++) exs.push(String(bodyExamples[i] || '').trim() || 'Example')
+    bodyComp.example = { body_text: [exs] }
+  }
+  components.push(bodyComp)
   if (footer) components.push({ type: 'FOOTER', text: footer })
 
   let metaId = null, status = 'PENDING', rejectReason = null
@@ -47,6 +71,7 @@ export async function createTemplate(business, { name, category, language, body,
     business_id: business.id, name: safeName, category: category || 'MARKETING',
     language: language || 'en', body, header, footer,
     meta_template_id: metaId, status, reject_reason: rejectReason,
+    variable_examples: { body: bodyExamples, header: headerExample },
   }).select().single()
 
   return { template: data, error }
@@ -76,19 +101,20 @@ export async function refreshTemplateStatuses(business) {
     const byName = new Map((existing || []).map(t => [t.name, t.id]))
 
     for (const mt of metaTemplates) {
-      // Extract body/header/footer from Meta's components array
-      let body = '', header = '', footer = ''
+      // Extract body/header/footer + example values from Meta's components array
+      let body = '', header = '', footer = '', bodyEx = [], headerEx = ''
       for (const c of (mt.components || [])) {
-        if (c.type === 'BODY')   body   = c.text || ''
-        if (c.type === 'HEADER' && c.format === 'TEXT') header = c.text || ''
+        if (c.type === 'BODY')   { body = c.text || ''; bodyEx = c.example?.body_text?.[0] || [] }
+        if (c.type === 'HEADER' && c.format === 'TEXT') { header = c.text || ''; headerEx = c.example?.header_text?.[0] || '' }
         if (c.type === 'FOOTER') footer = c.text || ''
       }
       const status = (mt.status || 'PENDING').toUpperCase()
+      const variable_examples = { body: bodyEx, header: headerEx }
 
       if (byName.has(mt.name)) {
         // Update status (and refresh content) of an existing row
         await supabase.from('templates')
-          .update({ status, meta_template_id: mt.id, body: body || undefined, header, footer })
+          .update({ status, meta_template_id: mt.id, body: body || undefined, header, footer, variable_examples })
           .eq('id', byName.get(mt.name))
       } else {
         // Import a template that exists in Meta but not in BizBot
@@ -100,6 +126,7 @@ export async function refreshTemplateStatuses(business) {
           body, header, footer,
           meta_template_id: mt.id,
           status,
+          variable_examples,
         })
       }
     }

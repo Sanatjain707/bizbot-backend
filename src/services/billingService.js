@@ -9,10 +9,49 @@ const razorpay = new Razorpay({
 })
 
 // ── Plan definitions ──────────────────────────────────
+// Same product, three commitment lengths. Longer commitment = lower effective
+// monthly cost — standard SaaS pattern. `months` drives the expiry math in
+// activatePlan and the Razorpay subscription total_count.
+//
+// Base rate: ₹999/month. Savings are relative to the quarterly rate.
+const BASE_FEATURES = [
+  'Unlimited AI WhatsApp conversations',
+  'Appointment booking + reminders',
+  'Automated payment follow-ups',
+  'Customer re-engagement + broadcasts',
+  'Full dashboard + analytics',
+  'Hindi & English support',
+]
+
 export const PLANS = {
-  starter: { name: 'Starter', price: 999,  conversations: 200,   features: ['200 AI conversations/month', 'Appointment booking', 'Automated reminders', '1 WhatsApp number'] },
-  growth:  { name: 'Growth',  price: 1999, conversations: 1000,  features: ['1,000 AI conversations/month', 'Everything in Starter', 'Payment follow-ups', 'Churn detection + re-engagement', 'Hindi/regional support'] },
-  pro:     { name: 'Pro',     price: 3999, conversations: 99999, features: ['Unlimited conversations', 'Everything in Growth', 'Multi-location', 'Custom AI persona', 'Priority support'] },
+  quarterly: {
+    name: 'Quarterly',
+    months: 3,
+    price: 2997,            // ₹999/mo × 3
+    effectiveMonthly: 999,
+    savingsPct: 0,
+    tagline: 'Try it for a quarter',
+    features: BASE_FEATURES,
+  },
+  half_yearly: {
+    name: 'Half-Yearly',
+    months: 6,
+    price: 5394,            // ₹899/mo × 6 (10% off)
+    effectiveMonthly: 899,
+    savingsPct: 10,
+    tagline: 'Most popular',
+    popular: true,
+    features: [...BASE_FEATURES, 'Save 10% vs quarterly'],
+  },
+  annual: {
+    name: 'Annual',
+    months: 12,
+    price: 9588,            // ₹799/mo × 12 (20% off)
+    effectiveMonthly: 799,
+    savingsPct: 20,
+    tagline: 'Best value',
+    features: [...BASE_FEATURES, 'Save 20% vs quarterly', 'Priority support'],
+  },
 }
 
 // APP_URL      = this backend's public URL (http://localhost:3000 or Railway URL)
@@ -20,7 +59,7 @@ export const PLANS = {
 // FRONTEND_URL = your dashboard URL (http://localhost:3001 or Vercel URL)
 //                The /callback route forwards the customer here to show success.
 
-// ── Create a one-time payment link (manual renewal) ───
+// ── Create a one-time payment link (full period upfront) ──
 export async function createPaymentLink(business, planKey) {
   const plan = PLANS[planKey]
   if (!plan) throw new Error('Invalid plan')
@@ -29,7 +68,7 @@ export async function createPaymentLink(business, planKey) {
     amount:         plan.price * 100,
     currency:       'INR',
     accept_partial: false,
-    description:    `BizBot ${plan.name} Plan — 1 month`,
+    description:    `BizBot ${plan.name} Plan — ${plan.months} months`,
     customer: {
       name:    business.owner_name || business.name,
       contact: business.owner_phone || '',
@@ -48,26 +87,33 @@ export async function createPaymentLink(business, planKey) {
   return { url: link.short_url, id: link.id }
 }
 
-// ── Create a recurring subscription (auto-renew) ──────
+// ── Create a recurring subscription (auto-renew per period) ──
+// Razorpay charges the full period amount every plan.months months, up to
+// total_count cycles. Two-year commitment on quarterly, one-year on the
+// others — matches the reality that annual plan doesn't need to renew often.
 export async function createSubscription(business, planKey) {
   const plan = PLANS[planKey]
   if (!plan) throw new Error('Invalid plan')
 
   const rzpPlan = await razorpay.plans.create({
     period:   'monthly',
-    interval: 1,
+    interval: plan.months,        // charge once per plan-period
     item: {
       name:     `BizBot ${plan.name}`,
       amount:   plan.price * 100,
       currency: 'INR',
     },
-    notes: { plan: planKey },
+    notes: { plan: planKey, months: String(plan.months) },
   })
+
+  // Cap subscriptions at ~2 years total so the customer keeps agency over
+  // very long commitments (they can always re-subscribe).
+  const totalCount = Math.max(1, Math.floor(24 / plan.months))
 
   const subscription = await razorpay.subscriptions.create({
     plan_id:         rzpPlan.id,
     customer_notify: 1,
-    total_count:     12,
+    total_count:     totalCount,
     notes: {
       business_id: business.id,
       plan:        planKey,
@@ -79,18 +125,30 @@ export async function createSubscription(business, planKey) {
 }
 
 // ── Verify webhook signature ──────────────────────────
-export function verifyWebhookSignature(body, signature) {
-  const expected = crypto
-    .createHmac('sha256', process.env.RAZORPAY_WEBHOOK_SECRET || process.env.RAZORPAY_KEY_SECRET)
-    .update(JSON.stringify(body))
-    .digest('hex')
-  return expected === signature
+// Razorpay signs the RAW JSON body. Re-JSON.stringify'ing a parsed body
+// loses whitespace/key-order and breaks the HMAC — so we require the raw
+// buffer captured by express.json({ verify: ... }).
+export function verifyWebhookSignature(rawBody, signature) {
+  if (!rawBody || !signature) return false
+  const secret = process.env.RAZORPAY_WEBHOOK_SECRET || process.env.RAZORPAY_KEY_SECRET
+  const raw = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(String(rawBody))
+  const expected = crypto.createHmac('sha256', secret).update(raw).digest('hex')
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(String(signature)))
+  } catch (_) { return false }
 }
 
 // ── Handle successful payment — activate plan ─────────
+// Expiry = now + plan.months. Was previously hardcoded to +1 month which
+// silently under-credited annual buyers by 11 months.
 export async function activatePlan(businessId, planKey, subscriptionId = null) {
+  const plan = PLANS[planKey]
+  if (!plan) {
+    console.error(`⚠️ activatePlan: unknown plan "${planKey}"`)
+    return
+  }
   const expiresAt = new Date()
-  expiresAt.setMonth(expiresAt.getMonth() + 1)
+  expiresAt.setMonth(expiresAt.getMonth() + plan.months)
 
   await supabase.from('businesses').update({
     plan:            planKey,
@@ -98,7 +156,7 @@ export async function activatePlan(businessId, planKey, subscriptionId = null) {
     razorpay_sub_id: subscriptionId,
   }).eq('id', businessId)
 
-  console.log(`✅ Plan activated: ${planKey} for business ${businessId}`)
+  console.log(`✅ Plan activated: ${planKey} (${plan.months} months) for business ${businessId}`)
 }
 
 // ── Fetch a payment link's current status + notes ─────
@@ -113,6 +171,9 @@ export async function fetchPaymentLink(linkId) {
 
 // ── Check if plan is active ───────────────────────────
 export function isPlanActive(business) {
+  // A platform admin can suspend a business from the operator console — the AI
+  // stops replying regardless of plan/expiry.
+  if (business.suspended) return false
   if (!business.plan_expires_at) return false
   return new Date(business.plan_expires_at) > new Date()
 }

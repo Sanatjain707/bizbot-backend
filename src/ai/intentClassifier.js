@@ -1,4 +1,10 @@
+// Intent classifier. Now a lightweight fallback — the backend dateResolver
+// is the source of truth for dates/times. The classifier's real job is to
+// distinguish book/reschedule/query/other and to pull service + customer name.
+// Date/time are still asked-for so we have a hint when the resolver misses.
+
 import { callGroq } from './groqClient.js'
+import { addDaysISO, istDateStr } from '../utils/dateTime.js'
 
 function parseClassifierJson(raw) {
   try {
@@ -10,13 +16,10 @@ function parseClassifierJson(raw) {
 }
 
 export async function classifyAppointmentIntent(userMsg, aiReply) {
-  const today    = new Date()
-  const tomorrow = new Date(today)
-  tomorrow.setDate(tomorrow.getDate() + 1)
-  const todayStr    = today.toISOString().split('T')[0]
-  const tomorrowStr = tomorrow.toISOString().split('T')[0]
+  const todayStr    = istDateStr()
+  const tomorrowStr = addDaysISO(todayStr, 1)
 
-  const extractPrompt = `Today's date is ${todayStr}.
+  const extractPrompt = `Today (IST) is ${todayStr}.
 
 Analyze this WhatsApp conversation.
 Return ONLY raw JSON, absolutely no markdown, no backticks, no explanation.
@@ -24,28 +27,29 @@ Return ONLY raw JSON, absolutely no markdown, no backticks, no explanation.
 Customer said: "${userMsg}"
 Bot replied: "${aiReply}"
 
-First decide the INTENT:
-- "book"      = customer is making a NEW booking
-- "reschedule"= customer is changing the time of an existing booking
-- "query"     = customer is just ASKING about an existing appointment (when is it, what time, etc) — NOT booking
+INTENT:
+- "book"       = customer is making a NEW booking
+- "reschedule" = customer is changing an existing booking
+- "query"     = customer is ASKING about an existing appointment (not booking)
 - "other"     = none of the above
 
-Rules for dates/times (only if booking or reschedule):
+Date/time hints (only if book or reschedule) — the backend re-resolves dates,
+so best-effort is fine:
 - "Today"/"aaj" → "${todayStr}", "Tomorrow"/"kal" → "${tomorrowStr}"
-- Time to 24hr HH:MM (3:15 PM = 15:15, 10 AM = 10:00)
-- "12-Jun-2026" → "2026-06-12"
-- A date with no year (e.g. "Fri, 12 Jun" or "12 Jun") → use the nearest such date that is today or later (use next year only if it already passed this year)
+- Time to 24hr HH:MM (3:15 PM = 15:15)
+- A date with no year → the nearest such date that is today or later
 
 Return exactly:
 {"intent":"book|reschedule|query|other","service":"name","date":"YYYY-MM-DD","time":"HH:MM","name":"full name"}
 
 If intent is "query" or "other", set service/date/time/name to empty strings.`
 
-  const result = await callGroq('You are a JSON intent classifier. Return only raw JSON, no markdown.', [], extractPrompt, {
-    maxTokens: 180,
-    temperature: 0,
-  })
+  const result = await callGroq(
+    'You are a JSON intent classifier. Return only raw JSON, no markdown.',
+    [],
+    extractPrompt,
+    { maxTokens: 180, temperature: 0 },
+  )
   if (!result) return null
-
   return parseClassifierJson(result)
 }

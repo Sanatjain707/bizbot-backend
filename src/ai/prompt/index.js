@@ -16,11 +16,9 @@ ${validationRules()}
 
 ${formattingRules()}
 
-${examples(business)}
-
 ${conversationRules(business)}
 
 ${bookingRules(bookingWindow)}
 
-Always be warm and helpful.`
+${examples(business)}`
 }
